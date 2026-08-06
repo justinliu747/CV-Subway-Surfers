@@ -76,7 +76,7 @@ export class GameRenderer {
     const spec = kind === 'high' ? OBSTACLES.HIGH : OBSTACLES.LOW;
     const geometry = new THREE.BoxGeometry(spec.w, spec.h, spec.d);
     const material = new THREE.MeshStandardMaterial({
-      color: kind === 'high' ? 0xe4572e : 0x2e86ab,
+      color: kind === 'high' ? 0xe4572e : 0x2ecc71,
       roughness: 0.55,
       metalness: 0.05,
     });

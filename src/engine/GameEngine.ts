@@ -1,6 +1,6 @@
-import { PHYSICS, RUN } from '../config/GameConfig';
+import { PHYSICS, PLAYER, RUN } from '../config/GameConfig';
 import { EventBus } from '../core/EventBus';
-import type { GameEvents, GameState, GestureEvent, Lane } from '../core/types';
+import type { GameEvents, GameState, GestureEvent, Lane, LaneGuides } from '../core/types';
 import { ObstacleManager } from './ObstacleManager';
 import { GameRenderer } from '../graphics/GameRenderer';
 import { KeyboardSource } from '../input/KeyboardSource';
@@ -48,6 +48,9 @@ export class GameEngine {
   private unsubscribers: Array<() => void> = [];
   private poseStarting: Promise<void> | null = null;
   private validationHooked = false;
+  private duckVisual = 0;
+  private latestLaneGuides: LaneGuides | null = null;
+  private latestHighlightLane: Lane | null = null;
 
   constructor(opts: {
     container: HTMLElement;
@@ -114,17 +117,27 @@ export class GameEngine {
 
     this.unsubscribers.push(
       this.bus.on('gesture', (event) => this.handleGesture(event)),
+      this.bus.on('poseLane', ({ lane }) => this.handlePoseLane(lane)),
       this.bus.on('status', ({ text }) => this.hud?.setStatus(text)),
       this.bus.on('calibration', (update) => {
         this.calibrationScreen?.update(update);
+        this.latestLaneGuides = update.laneGuides ?? null;
+        this.latestHighlightLane = update.highlightLane ?? null;
+        this.skeleton?.setLaneGuides(this.latestLaneGuides, this.latestHighlightLane);
+
         if (update.phase === 'validate' && !this.validationHooked) {
           this.validationHooked = true;
-          this.calibrator?.beginValidation(() => {
-            this.pose?.setDetectionEnabled(true);
+          this.calibrator?.beginValidation((enabled) => {
+            if (enabled) {
+              const draft = this.calibrator?.draftProfile();
+              if (draft) this.pose?.setProfile(draft);
+            }
+            this.pose?.setDetectionEnabled(enabled);
           });
         }
       }),
       this.bus.on('poseFrame', ({ landmarks }) => {
+        this.skeleton?.setLaneGuides(this.latestLaneGuides, this.latestHighlightLane);
         this.skeleton?.draw(landmarks);
       }),
     );
@@ -149,8 +162,10 @@ export class GameEngine {
     this.runSpeed = RUN.START_SPEED;
     this.currentLane = 0;
     this.accumulator = 0;
+    this.duckVisual = 0;
     this.hitGraceUntil = performance.now() + 750;
     this.hud.setScore(0);
+    if (this.playerMesh) this.playerMesh.scale.set(1, 1, 1);
     this.setState('RUNNING');
     this.physics.setHitsEnabled(true);
     this.setCameraStage(this.pose ? 'corner' : 'hidden');
@@ -165,6 +180,8 @@ export class GameEngine {
     this.runSpeed = RUN.START_SPEED;
     this.currentLane = 0;
     this.accumulator = 0;
+    this.duckVisual = 0;
+    if (this.playerMesh) this.playerMesh.scale.set(1, 1, 1);
     this.hud?.setScore(0);
     this.pose?.setDetectionEnabled(false);
     this.showStartMenu();
@@ -188,6 +205,9 @@ export class GameEngine {
     this.calibrationScreen?.hide();
     this.setCameraStage(this.pose ? 'corner' : 'hidden');
     this.skeleton?.setVisible(false);
+    this.skeleton?.setLaneGuides(null, null);
+    this.latestLaneGuides = null;
+    this.latestHighlightLane = null;
     this.setState('START_MENU');
     this.startScreen?.show({
       backend: this.renderer?.backendName ?? '?',
@@ -205,6 +225,8 @@ export class GameEngine {
     this.runSpeed = RUN.START_SPEED;
     this.currentLane = 0;
     this.accumulator = 0;
+    this.duckVisual = 0;
+    if (this.playerMesh) this.playerMesh.scale.set(1, 1, 1);
     this.hitGraceUntil = performance.now() + 500;
     this.hud?.setScore(0);
 
@@ -213,6 +235,7 @@ export class GameEngine {
       this.pose.setDetectionEnabled(true);
       this.setCameraStage('corner');
       this.skeleton?.setVisible(false);
+      this.skeleton?.setLaneGuides(null, null);
     } else {
       this.pose?.setDetectionEnabled(false);
       this.setCameraStage(this.pose ? 'corner' : 'hidden');
@@ -253,14 +276,20 @@ export class GameEngine {
     this.startScreen?.hide();
     this.pose.setDetectionEnabled(false);
     this.validationHooked = false;
+    this.latestLaneGuides = null;
+    this.latestHighlightLane = null;
     this.setCameraStage('center');
     this.skeleton?.setVisible(true);
+    this.skeleton?.setLaneGuides(null, null);
     this.setState('CALIBRATING');
     this.calibrationScreen.show();
 
     this.calibrator.start((profile) => {
       this.pose?.setDetectionEnabled(false);
       this.skeleton?.setVisible(false);
+      this.skeleton?.setLaneGuides(null, null);
+      this.latestLaneGuides = null;
+      this.latestHighlightLane = null;
       this.calibrationScreen?.hide();
 
       if (profile) {
@@ -344,6 +373,11 @@ export class GameEngine {
       physics.step();
     }
 
+    // Smooth duck visual toward physics duck state.
+    const duckTarget = physics.isDucking() ? 1 : 0;
+    const duckLerp = 1 - Math.exp(-PLAYER.DUCK_VISUAL_LERP_SPEED * frameDt);
+    this.duckVisual += (duckTarget - this.duckVisual) * duckLerp;
+
     this.syncPlayerMesh();
     renderer.render();
   }
@@ -352,6 +386,16 @@ export class GameEngine {
     if (!this.playerMesh || !this.physics) return;
     const p = this.physics.playerPosition();
     this.playerMesh.position.set(p.x, p.y, p.z);
+
+    const scaleY = 1 - this.duckVisual * (1 - PLAYER.DUCK_VISUAL_SCALE_Y);
+    this.playerMesh.scale.set(1, scaleY, 1);
+  }
+
+  private handlePoseLane(lane: Lane): void {
+    // Pose gestures during calibration must not drive gameplay.
+    if (this.state !== 'RUNNING' || !this.physics) return;
+    this.currentLane = lane;
+    this.physics.setTargetLane(lane);
   }
 
   private handleGesture(event: GestureEvent): void {

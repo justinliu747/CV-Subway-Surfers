@@ -108,6 +108,10 @@ export class PhysicsEngine {
     }
   }
 
+  isDucking(): boolean {
+    return this.duckRemainingMs > 0;
+  }
+
   updatePlayer(dt: number): void {
     const body = this.playerBody;
     const collider = this.playerCollider;

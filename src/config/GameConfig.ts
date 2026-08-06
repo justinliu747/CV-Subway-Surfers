@@ -9,6 +9,8 @@ export const PLAYER = {
   JUMP_VELOCITY: 9.5, // impulse = JUMP_VELOCITY * body.mass(); apex ~1.33m above start
   LANE_GAIN: 9, // proportional gain toward target lane centre
   LANE_MAX_SPEED: 12,
+  DUCK_VISUAL_SCALE_Y: 0.55, // mesh Y scale while ducked
+  DUCK_VISUAL_LERP_SPEED: 12, // how fast the visual squash approaches target
 } as const;
 
 export const RUN = { START_SPEED: 14, ACCEL: 0.25, MAX_SPEED: 32 } as const;
@@ -38,10 +40,9 @@ export const VISION = {
   MIN_VISIBILITY: 0.6,
   JUMP_RATIO: 0.18, // fallback / clamp reference: shoulder rise as a fraction of torso height
   DUCK_RATIO: 0.16, // fallback / clamp reference: shoulder drop as a fraction of torso height
-  LANE_RATIO: 0.35, // fallback / clamp reference: lateral offset as a fraction of shoulder width
   RELEASE_FACTOR: 0.6, // must fall back under ratio * this before re-firing
   COOLDOWN_MS: 350,
-  MIRROR: true, // default until auto-detected during guided calibration
+  LANE_SMOOTHING: 0.35, // EMA alpha for continuous lane signal (higher = snappier)
 } as const;
 
 export const CALIBRATION = {
@@ -54,8 +55,12 @@ export const CALIBRATION = {
   MIN_PEAK_OVER_NOISE: 3,
   THRESHOLD_FLOOR_FACTOR: 0.4,
   THRESHOLD_CEILING_FACTOR: 1.2,
+  MIN_LANE_SEPARATION: 0.08, // min |ΔlaneSignal| between adjacent captured lanes
+  VALIDATE_NEUTRAL_MS: 600, // must hold neutral before enabling jump/duck detection
+  VALIDATE_LANE_DWELL_MS: 700, // must stay in target lane this long to pass
+  VALIDATE_SUCCESS_PAUSE_MS: 500, // brief pause after each validate success
   PROFILE_STORAGE_KEY: 'subway-surfers-pose-profile-v1',
-  PROFILE_VERSION: 1,
+  PROFILE_VERSION: 2,
 } as const;
 
 export const KEYS = {

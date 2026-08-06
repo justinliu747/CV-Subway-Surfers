@@ -28,25 +28,41 @@ export interface PoseLandmarkPoint {
 export type CalibrationStepId =
   | 'framing'
   | 'neutral'
+  | 'lane_left'
+  | 'lane_center'
+  | 'lane_right'
   | 'jump'
   | 'duck'
-  | 'hop_left'
-  | 'hop_right'
   | 'validate'
   | 'done'
   | 'rejected';
 
-export type CalibrationUpdate =
-  | {
-      phase: 'framing' | 'neutral' | 'countdown' | 'capture' | 'validate' | 'done' | 'rejected';
-      step: CalibrationStepId;
-      instruction: string;
-      progress: number; // 0..1
-      countdown?: number;
-      deviation?: number;
-      peak?: number;
-      validated?: Partial<Record<'JUMP' | 'DUCK' | 'MOVE_LEFT' | 'MOVE_RIGHT', boolean>>;
-    };
+export type ValidateTarget = 'LANE_LEFT' | 'LANE_CENTER' | 'LANE_RIGHT' | 'JUMP' | 'DUCK';
+
+export interface LaneGuides {
+  /** Calibrated (or provisional) image-space X for the left lane centre (0..1). */
+  leftX: number;
+  /** Calibrated (or provisional) image-space X for the center lane centre (0..1). */
+  centerX: number;
+  /** Calibrated (or provisional) image-space X for the right lane centre (0..1). */
+  rightX: number;
+}
+
+export type CalibrationUpdate = {
+  phase: 'framing' | 'neutral' | 'countdown' | 'capture' | 'validate' | 'done' | 'rejected';
+  step: CalibrationStepId;
+  instruction: string;
+  progress: number; // 0..1
+  countdown?: number;
+  deviation?: number;
+  peak?: number;
+  laneGuides?: LaneGuides;
+  highlightLane?: Lane | null;
+  validateTarget?: ValidateTarget;
+  validateIndex?: number;
+  validateTotal?: number;
+  validateSuccess?: boolean;
+};
 
 export interface GameEvents {
   gesture: GestureEvent;
@@ -54,6 +70,7 @@ export interface GameEvents {
     landmarks: PoseLandmarkPoint[];
     sample: PoseSample | null;
   };
+  poseLane: { lane: Lane };
   calibration: CalibrationUpdate;
   state: { from: GameState; to: GameState };
   score: { value: number };

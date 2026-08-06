@@ -8,7 +8,7 @@ import type {
   PoseLandmarkPoint,
   PoseSample,
 } from '../core/types';
-import { defaultProfile, type PoseProfile } from './PoseProfile';
+import { classifyLane, defaultProfile, laneSignal, type PoseProfile } from './PoseProfile';
 
 export class PoseTracker implements IGestureSource {
   readonly name = 'pose' as const;
@@ -25,10 +25,9 @@ export class PoseTracker implements IGestureSource {
   private lastTimestampMs = -1;
 
   private jumpArmed = true;
-  private leftArmed = true;
-  private rightArmed = true;
   private duckActive = false;
   private lastEdgeAt = 0;
+  private smoothedLaneSignal: number | null = null;
 
   private readonly onFrame: (now: number) => void;
 
@@ -40,6 +39,7 @@ export class PoseTracker implements IGestureSource {
 
   setProfile(profile: PoseProfile): void {
     this.profile = profile;
+    this.smoothedLaneSignal = null;
   }
 
   getProfile(): PoseProfile {
@@ -50,9 +50,8 @@ export class PoseTracker implements IGestureSource {
     this.detectionEnabled = enabled;
     if (!enabled) {
       this.jumpArmed = true;
-      this.leftArmed = true;
-      this.rightArmed = true;
       this.duckActive = false;
+      this.smoothedLaneSignal = null;
     }
   }
 
@@ -138,6 +137,7 @@ export class PoseTracker implements IGestureSource {
 
         if (this.detectionEnabled && sample) {
           this.evaluateGestures(sample, timestampMs);
+          this.evaluateLane(sample);
         }
       });
     } catch (error) {
@@ -178,16 +178,10 @@ export class PoseTracker implements IGestureSource {
     const baseline = this.profile.baseline;
     const thresholds = this.profile.thresholds;
     const torso = Math.max(0.05, baseline.torsoHeight);
-    const shoulderW = Math.max(0.05, baseline.shoulderWidth);
 
     // Image Y grows downward, so rising shoulders -> smaller Y.
     const shoulderDeltaUp = (baseline.shoulderY - sample.shoulderMidY) / torso;
     const shoulderDeltaDown = (sample.shoulderMidY - baseline.shoulderY) / torso;
-
-    const noseDelta = sample.noseX - baseline.noseX;
-    const shoulderDelta = sample.shoulderMidX - baseline.shoulderMidX;
-    let lateral = (0.4 * noseDelta + 0.6 * shoulderDelta) / shoulderW;
-    if (this.profile.mirror) lateral = -lateral;
 
     const cooldownOk = now - this.lastEdgeAt >= VISION.COOLDOWN_MS;
 
@@ -211,29 +205,19 @@ export class PoseTracker implements IGestureSource {
     } else if (shoulderDeltaUp <= thresholds.jump * VISION.RELEASE_FACTOR) {
       this.jumpArmed = true;
     }
+  }
 
-    // Lane edges (independent left/right thresholds).
-    if (lateral <= -thresholds.laneLeft) {
-      if (this.leftArmed && cooldownOk) {
-        this.leftArmed = false;
-        this.rightArmed = true;
-        this.lastEdgeAt = now;
-        this.emit('MOVE_LEFT', now);
-      }
-    } else if (lateral >= -thresholds.laneLeft * VISION.RELEASE_FACTOR) {
-      this.leftArmed = true;
+  private evaluateLane(sample: PoseSample): void {
+    const raw = laneSignal(sample);
+    const alpha = VISION.LANE_SMOOTHING;
+    if (this.smoothedLaneSignal === null) {
+      this.smoothedLaneSignal = raw;
+    } else {
+      this.smoothedLaneSignal = alpha * raw + (1 - alpha) * this.smoothedLaneSignal;
     }
 
-    if (lateral >= thresholds.laneRight) {
-      if (this.rightArmed && cooldownOk) {
-        this.rightArmed = false;
-        this.leftArmed = true;
-        this.lastEdgeAt = now;
-        this.emit('MOVE_RIGHT', now);
-      }
-    } else if (lateral <= thresholds.laneRight * VISION.RELEASE_FACTOR) {
-      this.rightArmed = true;
-    }
+    const lane = classifyLane(this.smoothedLaneSignal, this.profile.lanes);
+    this.bus.emit('poseLane', { lane });
   }
 
   private emit(gesture: Gesture, at: number): void {
