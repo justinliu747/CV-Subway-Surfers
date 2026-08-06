@@ -1,0 +1,275 @@
+/* Base layout */
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #0b0f14;
+  color: #f5f7fa;
+  font-family: Inter, Segoe UI, system-ui, sans-serif;
+}
+
+#app {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+
+#game-container {
+  position: absolute;
+  inset: 0;
+}
+
+#hud,
+#ui-root {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 2;
+}
+
+#ui-root {
+  z-index: 4;
+}
+
+#boot-error {
+  position: absolute;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  text-align: center;
+  background: #0b0f14;
+  z-index: 10;
+}
+
+#boot-error.visible {
+  display: flex;
+}
+
+/* Camera stage */
+#camera-stage {
+  position: absolute;
+  z-index: 5;
+  overflow: hidden;
+  background: #111;
+  border: 2px solid rgba(255, 255, 255, 0.35);
+  border-radius: 12px;
+  transform: scaleX(-1);
+}
+
+#camera-stage.stage-hidden {
+  display: none;
+}
+
+#camera-stage.stage-corner {
+  display: block;
+  right: 16px;
+  bottom: 16px;
+  width: 180px;
+  height: 135px;
+  opacity: 0.92;
+}
+
+#camera-stage.stage-center {
+  display: block;
+  left: 50%;
+  top: 18%;
+  width: min(520px, 70vw);
+  height: min(390px, 42vh);
+  transform: translateX(-50%) scaleX(-1);
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.45);
+}
+
+#webcam,
+#skeleton {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+#skeleton {
+  pointer-events: none;
+}
+
+/* HUD */
+.hud-panel {
+  position: absolute;
+  top: 16px;
+  left: 16px;
+  right: 16px;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-weight: 600;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.65);
+  pointer-events: none;
+}
+
+.hud-score {
+  font-size: 28px;
+  letter-spacing: 0.04em;
+}
+
+.hud-state {
+  font-size: 14px;
+  opacity: 0.9;
+  text-transform: uppercase;
+}
+
+.hud-status {
+  position: absolute;
+  left: 16px;
+  bottom: 16px;
+  max-width: min(420px, 70vw);
+  font-size: 13px;
+  opacity: 0.85;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.65);
+  pointer-events: none;
+}
+
+.hud-hidden {
+  display: none !important;
+}
+
+/* Shared screens */
+.screen-overlay {
+  position: absolute;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: rgba(5, 10, 16, 0.62);
+  pointer-events: auto;
+  z-index: 6;
+}
+
+.screen-overlay.visible {
+  display: flex;
+}
+
+.screen-card {
+  background: rgba(16, 24, 32, 0.94);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 16px;
+  padding: 28px 32px;
+  width: min(460px, 92vw);
+  text-align: center;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+}
+
+.screen-card.calibration-card {
+  width: min(540px, 94vw);
+  margin-top: min(42vh, 420px);
+}
+
+.screen-card h1,
+.screen-card h2 {
+  font-size: 28px;
+  margin-bottom: 10px;
+}
+
+.screen-card p {
+  opacity: 0.9;
+  line-height: 1.45;
+  margin-bottom: 16px;
+}
+
+.screen-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: center;
+  margin-top: 8px;
+}
+
+.screen-btn {
+  pointer-events: auto;
+  border: 0;
+  border-radius: 999px;
+  padding: 10px 18px;
+  background: #ffc857;
+  color: #1a1a1a;
+  font-weight: 700;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.screen-btn:hover {
+  filter: brightness(1.05);
+}
+
+.screen-btn.secondary {
+  background: rgba(255, 255, 255, 0.12);
+  color: #f5f7fa;
+}
+
+.screen-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+  filter: none;
+}
+
+.screen-meta {
+  font-size: 13px;
+  opacity: 0.75;
+  margin-top: 14px;
+}
+
+.progress-bar {
+  width: 100%;
+  height: 10px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.12);
+  overflow: hidden;
+  margin: 12px 0 4px;
+}
+
+.progress-fill {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, #2e86ab, #ffc857);
+  transition: width 80ms linear;
+}
+
+.countdown-num {
+  font-size: 48px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  margin: 8px 0;
+  color: #ffc857;
+}
+
+.checklist {
+  list-style: none;
+  text-align: left;
+  margin: 12px auto 8px;
+  max-width: 260px;
+}
+
+.checklist li {
+  padding: 6px 0;
+  opacity: 0.55;
+}
+
+.checklist li.done {
+  opacity: 1;
+  color: #8fd19e;
+}
+
+.checklist li.done::before {
+  content: '✓ ';
+}
+
+.checklist li:not(.done)::before {
+  content: '○ ';
+}
