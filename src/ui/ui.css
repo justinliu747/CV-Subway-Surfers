@@ -172,10 +172,27 @@ body {
   margin-top: min(42vh, 420px);
 }
 
+.screen-card.calibration-card [data-role='instruction'] {
+  font-size: clamp(22px, 4.2vw, 32px);
+  font-weight: 800;
+  line-height: 1.25;
+  letter-spacing: 0.01em;
+  color: #ffc857;
+  opacity: 1;
+  margin: 12px 0 18px;
+}
+
 .screen-card h1,
 .screen-card h2 {
   font-size: 28px;
   margin-bottom: 10px;
+}
+
+.screen-card.calibration-card h2 {
+  font-size: 18px;
+  font-weight: 600;
+  opacity: 0.75;
+  margin-bottom: 4px;
 }
 
 .screen-card p {
@@ -305,4 +322,156 @@ body {
 
 .calibration-card.validate-success [data-role='instruction'] {
   color: #8fd19e;
+}
+
+/* Hand UI calibration */
+.hand-cycle-badge {
+  display: inline-block;
+  margin: 4px auto 8px;
+  padding: 4px 12px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #1a1a1a;
+  background: #ffc857;
+}
+
+.hand-corner-targets {
+  position: relative;
+  width: min(220px, 56vw);
+  height: min(160px, 28vh);
+  margin: 16px auto 8px;
+  border: 1px dashed rgba(255, 255, 255, 0.28);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.hand-corner-dot {
+  position: absolute;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: rgba(255, 255, 255, 0.55);
+  background: rgba(255, 255, 255, 0.1);
+  border: 2px solid rgba(255, 255, 255, 0.3);
+  transform: translate(-50%, -50%);
+}
+
+.hand-corner-dot[data-c='tl'] {
+  left: 0;
+  top: 0;
+}
+
+.hand-corner-dot[data-c='tr'] {
+  left: 100%;
+  top: 0;
+}
+
+.hand-corner-dot[data-c='br'] {
+  left: 100%;
+  top: 100%;
+}
+
+.hand-corner-dot[data-c='bl'] {
+  left: 0;
+  top: 100%;
+}
+
+.hand-corner-dot.current {
+  color: #1a1a1a;
+  background: #ffc857;
+  border-color: #ffc857;
+  box-shadow: 0 0 0 4px rgba(255, 200, 87, 0.28);
+}
+
+.hand-corner-dot.done {
+  color: #102018;
+  background: #8fd19e;
+  border-color: #8fd19e;
+}
+
+.pinch-bar {
+  margin: 10px 0 4px;
+  text-align: left;
+}
+
+.pinch-label {
+  display: block;
+  font-size: 11px;
+  opacity: 0.7;
+  margin-bottom: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.pinch-progress .progress-fill {
+  background: linear-gradient(90deg, #8fd19e, #ffc857);
+}
+
+/* Hand cursor overlay */
+.hand-cursor {
+  position: fixed;
+  left: 0;
+  top: 0;
+  width: 0;
+  height: 0;
+  z-index: 20;
+  pointer-events: none;
+  will-change: transform;
+}
+
+.hand-cursor-dot {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 14px;
+  height: 14px;
+  margin: -7px 0 0 -7px;
+  border-radius: 50%;
+  background: #ffc857;
+  border: 2px solid rgba(20, 24, 28, 0.85);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+}
+
+.hand-cursor-ring {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 36px;
+  height: 36px;
+  margin: -18px 0 0 -18px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 200, 87, 0.35);
+  --pinch: 0;
+  background: conic-gradient(
+    #8fd19e calc(var(--pinch) * 1turn),
+    rgba(255, 255, 255, 0.12) 0
+  );
+  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 2px));
+  mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 2px));
+  opacity: 0;
+  transition: opacity 80ms linear;
+}
+
+.hand-cursor.pinching .hand-cursor-ring {
+  opacity: 1;
+}
+
+.hand-cursor.held .hand-cursor-dot {
+  background: #8fd19e;
+  transform: scale(0.85);
+}
+
+.screen-btn.hand-hover {
+  outline: 2px solid #ffc857;
+  outline-offset: 3px;
+  filter: brightness(1.08);
 }

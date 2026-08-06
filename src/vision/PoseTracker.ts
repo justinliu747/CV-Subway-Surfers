@@ -16,7 +16,6 @@ export class PoseTracker implements IGestureSource {
   private readonly video: HTMLVideoElement;
   private readonly bus: EventBus<GameEvents>;
   private landmarker: PoseLandmarker | null = null;
-  private stream: MediaStream | null = null;
   private running = false;
   private detectionEnabled = false;
   private profile: PoseProfile = defaultProfile();
@@ -55,19 +54,13 @@ export class PoseTracker implements IGestureSource {
     }
   }
 
+  /** Assumes `#webcam` already has an active MediaStream (see GameEngine.ensureCameraStarted). */
   async start(): Promise<void> {
     if (this.running) return;
 
-    this.stream = await navigator.mediaDevices.getUserMedia({
-      audio: false,
-      video: {
-        facingMode: 'user',
-        width: { ideal: 640 },
-        height: { ideal: 480 },
-      },
-    });
-    this.video.srcObject = this.stream;
-    await this.video.play();
+    if (!this.video.srcObject) {
+      throw new Error('PoseTracker.start() requires an active camera on the video element');
+    }
 
     const fileset = await FilesetResolver.forVisionTasks(VISION.WASM_BASE);
     this.landmarker = await PoseLandmarker.createFromOptions(fileset, {
@@ -97,12 +90,6 @@ export class PoseTracker implements IGestureSource {
 
     this.landmarker?.close();
     this.landmarker = null;
-
-    if (this.stream) {
-      for (const track of this.stream.getTracks()) track.stop();
-      this.stream = null;
-    }
-    this.video.srcObject = null;
   }
 
   private scheduleNextFrame(): void {

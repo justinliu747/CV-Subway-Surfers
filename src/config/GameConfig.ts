@@ -25,10 +25,11 @@ export const PHYSICS = {
 
 export const OBSTACLES = {
   POOL_SIZE: 12,
-  SPAWN_Z: -140,
+  SPAWN_Z: -70,
   DESPAWN_Z: 12,
   MIN_GAP: 18,
   MAX_GAP: 30,
+  FIRST_GAP: 8, // short gap so the first obstacle appears quickly after reset
   HIGH: { w: 0.9, h: 1.0, d: 0.8, centreY: 0.5 }, // jump over; apex clears it
   LOW: { w: 1.6, h: 0.5, d: 0.8, centreY: 1.75 }, // duck under; hangs above a ducked capsule
 } as const;
@@ -37,12 +38,47 @@ export const VISION = {
   WASM_BASE: 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/wasm',
   MODEL_URL:
     'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
+  HAND_MODEL_URL:
+    'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
   MIN_VISIBILITY: 0.6,
   JUMP_RATIO: 0.18, // fallback / clamp reference: shoulder rise as a fraction of torso height
   DUCK_RATIO: 0.16, // fallback / clamp reference: shoulder drop as a fraction of torso height
   RELEASE_FACTOR: 0.6, // must fall back under ratio * this before re-firing
   COOLDOWN_MS: 350,
   LANE_SMOOTHING: 0.35, // EMA alpha for continuous lane signal (higher = snappier)
+} as const;
+
+/** Menu hand-cursor / pinch-click (never active during RUNNING). */
+export const HAND_UI = {
+  /** Fallback scale-normalized pinch ratio (tipDistance / wrist→middleMCP). */
+  PINCH_RATIO_CLOSE: 0.35,
+  PINCH_RATIO_OPEN: 0.55,
+  PINCH_HOLD_MS: 250, // hold duration to commit corner save / button click
+  CLICK_COOLDOWN_MS: 500, // ignore further commits after a click
+  FRAMING_FRAMES: 20, // consecutive frames with a visible hand
+  CORNER_SAMPLE_FRAMES: 8, // average wrist samples while pinch is held
+  PINCH_CYCLES: 3, // open/close pairs during pinch calibration
+  PINCH_SAMPLE_MS: 1500, // dwell while user holds pinch or open pose
+  PINCH_MIN_CONTRAST: 0.08, // min (openMean - closedMean) to accept calib
+  PINCH_CLOSE_LERP: 0.35, // closed→open blend for close threshold
+  PINCH_OPEN_LERP: 0.55, // closed→open blend for open threshold
+  HAND_SCALE_MIN: 0.02, // floor for wrist→MCP scale
+  MIN_QUAD_AREA: 0.02, // min parallelogram area in mirrored camera space
+  MIRROR_X: true, // selfie preview is CSS-mirrored; store/map in display space
+  CURSOR_ALPHA_SLOW: 0.18, // EMA alpha for tiny motion / shake
+  CURSOR_ALPHA_FAST: 0.85, // EMA alpha for large flicks
+  CURSOR_SPEED_LO: 0.004, // display-space delta → slow alpha
+  CURSOR_SPEED_HI: 0.04, // display-space delta → fast alpha
+  PROFILE_STORAGE_KEY: 'subway-surfers-hand-profile-v1',
+  PROFILE_VERSION: 3,
+} as const;
+
+/** MediaPipe Hand landmark indices used by HandTracker. */
+export const HAND_LANDMARK = {
+  WRIST: 0,
+  THUMB_TIP: 4,
+  INDEX_TIP: 8,
+  MIDDLE_MCP: 9,
 } as const;
 
 export const CALIBRATION = {

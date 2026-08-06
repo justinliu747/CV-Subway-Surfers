@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Hand UI Controls** — MediaPipe Hands cursor for menu screens with pinch-to-click on start, game-over, and calibration buttons.
+- **Hand UI Setup** — separate calibration: pinch/open cycles, 4-corner interaction area, handedness lock (`HandProfile` v3 in localStorage).
+- **Shared webcam stream** — `GameEngine.ensureCameraStarted()` owns the camera; pose and hand trackers share `#webcam`.
+
+### Changed
+
+- **Start screen** — Hand UI Setup / Enable Hand Controls / Recalibrate Hand UI button.
+- **Hand cursor** — tracks wrist; pinch uses thumb + index; scale-normalized `pinchRatio` thresholds from calibration.
+- **Adaptive cursor smoothing** — velocity-based EMA damps jitter without lag on large moves.
+- **Shorter runway** — obstacles spawn sooner (`SPAWN_Z: -70`, `FIRST_GAP: 8`).
+- **Calibration UI** — larger stage instructions; 1.5s pinch/open dwell during hand setup.
+
+### Fixed
+
+- **Recalibrate Hand UI** — clears previous handedness/pinch profile so a different hand can be calibrated fresh.
+
 ## [0.2.0] - 2026-08-06
 
 Compared to the initial commit (`140244e` — WebGPU Motion Runner MVP with edge-triggered lean/hop lane gestures).

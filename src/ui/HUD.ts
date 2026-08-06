@@ -56,7 +56,10 @@ export class HUD {
     this.stateEl.textContent = state;
     const showHud = state === 'RUNNING' || state === 'GAME_OVER';
     this.panel.classList.toggle('hud-hidden', !showHud);
-    this.statusEl.classList.toggle('hud-hidden', state === 'START_MENU' || state === 'CALIBRATING');
+    this.statusEl.classList.toggle(
+      'hud-hidden',
+      state === 'START_MENU' || state === 'CALIBRATING' || state === 'HAND_CALIBRATING',
+    );
     this.gameOverActions.classList.toggle('visible', state === 'GAME_OVER');
   }
 

@@ -34,7 +34,7 @@ export class ObstacleManager {
       });
     }
 
-    this.nextGap = this.randomGap();
+    this.nextGap = OBSTACLES.FIRST_GAP;
   }
 
   update(dt: number, runSpeed: number): void {
@@ -66,7 +66,7 @@ export class ObstacleManager {
       if (item.active) this.recycle(item);
     }
     this.distanceSinceSpawn = 0;
-    this.nextGap = this.randomGap();
+    this.nextGap = OBSTACLES.FIRST_GAP;
   }
 
   private trySpawn(): void {
