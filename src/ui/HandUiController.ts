@@ -75,17 +75,17 @@ export class HandUiController {
   }
 
   private hitTest(x: number, y: number): HTMLButtonElement | null {
-    const buttons = document.querySelectorAll<HTMLButtonElement>(
-      '.screen-overlay.visible .screen-btn:not([hidden])',
-    );
-    for (const btn of buttons) {
-      if (btn.disabled) continue;
-      const r = btn.getBoundingClientRect();
-      if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
-        return btn;
-      }
-    }
-    return null;
+    // Cursor x/y are in the portrait #app. The app is rotated 90° clockwise
+    // (origin top-left, after translateY(-100%)), so viewport = (appHeight - y, x).
+    const app = document.getElementById('app');
+    const h = app?.clientHeight || window.innerHeight;
+    const el = document.elementFromPoint(h - y, x);
+    const btn = el?.closest('button');
+    if (!(btn instanceof HTMLButtonElement) || btn.disabled || btn.hidden) return null;
+    const debug = btn.closest('.debug-overlay');
+    if (debug instanceof HTMLElement && !debug.hidden) return btn;
+    if (!btn.closest('.screen-overlay.visible')) return null;
+    return btn;
   }
 
   private clearHover(): void {

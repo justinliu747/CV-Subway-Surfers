@@ -1,61 +1,61 @@
-import { HAND_UI } from '../config/GameConfig';
+import { CALIBRATION, HAND_UI } from '../config/GameConfig';
 import type { EventBus } from '../core/EventBus';
 import type {
+  CalibrationFeedback,
   GameEvents,
-  HandCalibrationUpdate,
-  HandCornerId,
-  HandCorners,
+  HandCalibrationStep,
+  HandFrameEvent,
   Handedness,
-  Vec2,
 } from '../core/types';
-import {
-  averagePoints,
-  validateHandCorners,
-  type HandProfile,
-} from './HandProfile';
+import type { HandProfile } from './HandProfile';
 
-const CORNER_ORDER: HandCornerId[] = ['tl', 'tr', 'br', 'bl'];
+const STEPS: HandCalibrationStep[] = ['raise', 'pinch'];
 
-const CORNER_LABEL: Record<HandCornerId, string> = {
-  tl: 'top-left',
-  tr: 'top-right',
-  br: 'bottom-right',
-  bl: 'bottom-left',
-};
+interface PinchRep {
+  closed: number;
+  open: number;
+}
 
-type CalibStep = 'framing' | 'pinch' | 'open' | HandCornerId | 'rejected' | 'done';
-
+/**
+ * Two prompts, like the body calibration: raise the menu hand (hold bar), then
+ * pinch twice (rep dots). The pointing area comes from the body tracker, so
+ * there are no corners to set. Pinch reps are found relative to your own open
+ * hand, so no thresholds are needed before they are measured.
+ */
 export class HandCalibrator {
   private readonly bus: EventBus<GameEvents>;
   private unsubscribeFrame: (() => void) | null = null;
   private active = false;
-  private step: CalibStep = 'framing';
-  private framingCount = 0;
-  private corners: Partial<HandCorners> = {};
-  private cursorSamples: Vec2[] = [];
+  private step: HandCalibrationStep = 'raise';
+  private stepStartedAt = 0;
+  private hintOverride: string | null = null;
   private onComplete: ((profile: HandProfile | null) => void) | null = null;
-  private waitingRelease = false;
-  private handednessVotes: Partial<Record<Handedness, number>> = {};
-  private lockedHandedness: Handedness | null = null;
-
-  private pinchCycle = 0; // 0-based index into PINCH_CYCLES
-  private sampleStartedAt = 0;
-  private ratioSamples: number[] = [];
-  private closedMeans: number[] = [];
-  private openMeans: number[] = [];
-  private pinchClose: number = HAND_UI.PINCH_RATIO_CLOSE;
-  private pinchOpen: number = HAND_UI.PINCH_RATIO_OPEN;
   private onPinchThresholds: ((close: number, open: number) => void) | null = null;
   private onHandednessLock: ((handedness: Handedness) => void) | null = null;
+
+  private handedness: Handedness | null = null;
+  private raiseSide: Handedness | null = null;
+  private raiseSince = 0;
+
+  /** Recent pinch ratios; their max is your open hand. */
+  private openWindow: Array<{ t: number; ratio: number }> = [];
+  /** Set while a pinch is in progress: open reference at its start, lowest ratio so far. */
+  private repOpen: number | null = null;
+  private repMin = Infinity;
+  private reps: PinchRep[] = [];
+
+  private pinchClose: number = HAND_UI.PINCH_RATIO_CLOSE;
+  private pinchOpen: number = HAND_UI.PINCH_RATIO_OPEN;
+  private completeUntil: number | null = null;
+  private completeFeedback: CalibrationFeedback = hold(1, 1);
 
   constructor(bus: EventBus<GameEvents>) {
     this.bus = bus;
   }
 
   /**
-   * @param onPinchThresholds Called after successful pinch calib so HandTracker
-   *   can use the new thresholds for the corner steps.
-   * @param onHandednessLock Called after framing so HandTracker filters to that hand.
+   * @param onPinchThresholds Lets HandTracker use the new thresholds right away.
+   * @param onHandednessLock Lets HandTracker follow the chosen hand.
    */
   start(
     onComplete: (profile: HandProfile | null) => void,
@@ -67,65 +67,15 @@ export class HandCalibrator {
     this.onPinchThresholds = onPinchThresholds ?? null;
     this.onHandednessLock = onHandednessLock ?? null;
     this.active = true;
-    this.step = 'framing';
-    this.framingCount = 0;
-    this.corners = {};
-    this.cursorSamples = [];
-    this.waitingRelease = false;
-    this.handednessVotes = {};
-    this.lockedHandedness = null;
-    this.pinchCycle = 0;
-    this.sampleStartedAt = 0;
-    this.ratioSamples = [];
-    this.closedMeans = [];
-    this.openMeans = [];
+    this.handedness = null;
     this.pinchClose = HAND_UI.PINCH_RATIO_CLOSE;
     this.pinchOpen = HAND_UI.PINCH_RATIO_OPEN;
 
     this.unsubscribeFrame = this.bus.on('handFrame', (frame) => {
       if (!this.active) return;
-      this.onFrame(frame);
+      this.onFrame(frame, performance.now());
     });
-
-    this.emitUpdate({
-      phase: 'framing',
-      instruction: 'Show the hand you will use for the menus.',
-      progress: 0,
-      captured: {},
-    });
-  }
-
-  redoLastCorner(): void {
-    if (!this.active) return;
-    if (this.step === 'rejected') {
-      // If pinch failed, restart pinch calib; otherwise redo missing corner.
-      if (this.closedMeans.length < HAND_UI.PINCH_CYCLES || this.openMeans.length < HAND_UI.PINCH_CYCLES) {
-        this.beginPinchCycle(0);
-        return;
-      }
-      const next = this.nextMissingCorner();
-      if (next) {
-        this.beginCorner(next);
-      } else {
-        this.beginCorner('tl');
-      }
-      return;
-    }
-
-    if (this.step === 'pinch' || this.step === 'open') {
-      this.beginPinchCycle(Math.max(0, this.pinchCycle));
-      return;
-    }
-
-    const idx = CORNER_ORDER.indexOf(this.step as HandCornerId);
-    if (idx < 0) return;
-    if (idx === 0) {
-      this.beginCorner('tl');
-      return;
-    }
-    const prev = CORNER_ORDER[idx - 1]!;
-    delete this.corners[prev];
-    this.beginCorner(prev);
+    this.enter('raise', performance.now());
   }
 
   cancel(): void {
@@ -133,316 +83,167 @@ export class HandCalibrator {
     this.finish(null);
   }
 
-  private onFrame(frame: {
-    cursor: Vec2 | null;
-    handedness: Handedness | null;
-    pinchRatio: number | null;
-    pinchHeld: boolean;
-    pinchCommit: boolean;
-    pinchProgress: number;
-  }): void {
-    if (frame.handedness) {
-      this.noteHandedness(frame.handedness);
-    }
-
-    if (this.step === 'framing') {
-      if (frame.cursor) {
-        this.framingCount += 1;
-      } else {
-        this.framingCount = 0;
+  private onFrame(frame: HandFrameEvent, now: number): void {
+    if (this.completeUntil !== null) {
+      if (now < this.completeUntil) {
+        this.emit('Nice!', this.completeFeedback);
+        return;
       }
-      const progress = Math.min(1, this.framingCount / HAND_UI.FRAMING_FRAMES);
-      this.emitUpdate({
-        phase: 'framing',
-        instruction: frame.cursor
-          ? 'Hand detected — hold still…'
-          : 'Show the hand you will use for the menus.',
-        progress: progress * 0.15,
-        pinchProgress: 0,
-        captured: this.capturedFlags(),
-      });
-      if (this.framingCount >= HAND_UI.FRAMING_FRAMES) {
-        this.lockedHandedness = this.majorityHandedness();
-        this.onHandednessLock?.(this.lockedHandedness);
-        this.beginPinchCycle(0);
-      }
+      this.completeUntil = null;
+      this.advance(now);
       return;
     }
 
-    if (this.step === 'pinch' || this.step === 'open') {
-      this.handlePinchSample(frame);
-      return;
-    }
-
-    if (this.step === 'rejected' || this.step === 'done') return;
-    if (!CORNER_ORDER.includes(this.step as HandCornerId)) return;
-
-    const corner = this.step as HandCornerId;
-
-    if (this.waitingRelease) {
-      if (!frame.pinchHeld && frame.pinchProgress === 0) {
-        this.waitingRelease = false;
-        this.advanceAfterCorner(corner);
-      }
-      this.emitCorner(corner, frame.pinchProgress);
-      return;
-    }
-
-    if (frame.cursor && (frame.pinchHeld || frame.pinchProgress > 0)) {
-      this.cursorSamples.push(frame.cursor);
-      if (this.cursorSamples.length > HAND_UI.CORNER_SAMPLE_FRAMES) {
-        this.cursorSamples.shift();
-      }
-    }
-
-    if (frame.pinchCommit && frame.cursor) {
-      const sample =
-        this.cursorSamples.length > 0 ? averagePoints(this.cursorSamples) : frame.cursor;
-      this.corners[corner] = sample;
-      this.cursorSamples = [];
-      this.waitingRelease = true;
-    }
-
-    this.emitCorner(corner, frame.pinchProgress);
+    if (this.step === 'raise') this.handleRaise(frame, now);
+    else if (this.step === 'pinch') this.handlePinch(frame, now);
   }
 
-  private handlePinchSample(frame: {
-    cursor: Vec2 | null;
-    pinchRatio: number | null;
-  }): void {
-    const isPinch = this.step === 'pinch';
-    const cycleHuman = this.pinchCycle + 1;
-    const total = HAND_UI.PINCH_CYCLES;
-
-    if (!frame.cursor || frame.pinchRatio === null) {
-      this.sampleStartedAt = 0;
-      this.ratioSamples = [];
-      this.emitUpdate({
-        phase: isPinch ? 'pinch' : 'open',
-        instruction: isPinch
-          ? `PINCH and hold (${cycleHuman}/${total}) — keep your hand in view`
-          : `OPEN your hand (${cycleHuman}/${total}) — keep your hand in view`,
-        progress: this.pinchPhaseProgress(0),
-        pinchProgress: 0,
-        pinchCycle: cycleHuman,
-        pinchCyclesTotal: total,
-        captured: this.capturedFlags(),
-      });
+  private handleRaise(frame: HandFrameEvent, now: number): void {
+    const { Left, Right } = frame.raised;
+    const side: Handedness | null = Left === Right ? null : Left ? 'Left' : 'Right';
+    if (!side) {
+      this.raiseSide = null;
+      this.emit(
+        Left && Right ? 'Raise just one hand' : this.instruction(now),
+        hold(0, HAND_UI.RAISE_HOLD_MS),
+      );
       return;
     }
-
-    const now = performance.now();
-    if (this.sampleStartedAt === 0) {
-      this.sampleStartedAt = now;
-      this.ratioSamples = [];
+    if (side !== this.raiseSide) {
+      this.raiseSide = side;
+      this.raiseSince = now;
     }
-
-    this.ratioSamples.push(frame.pinchRatio);
-    const elapsed = now - this.sampleStartedAt;
-    const dwell = Math.min(1, elapsed / HAND_UI.PINCH_SAMPLE_MS);
-
-    this.emitUpdate({
-      phase: isPinch ? 'pinch' : 'open',
-      instruction: isPinch
-        ? `PINCH and hold (${cycleHuman}/${total})`
-        : `OPEN your hand (${cycleHuman}/${total})`,
-      progress: this.pinchPhaseProgress(dwell),
-      pinchProgress: dwell,
-      pinchCycle: cycleHuman,
-      pinchCyclesTotal: total,
-      captured: this.capturedFlags(),
-    });
-
-    if (elapsed < HAND_UI.PINCH_SAMPLE_MS) return;
-
-    const mean = this.mean(this.ratioSamples);
-    if (isPinch) {
-      this.closedMeans.push(mean);
-      this.step = 'open';
-      this.sampleStartedAt = 0;
-      this.ratioSamples = [];
-      this.emitUpdate({
-        phase: 'open',
-        instruction: `OPEN your hand (${cycleHuman}/${total})`,
-        progress: this.pinchPhaseProgress(0),
-        pinchProgress: 0,
-        pinchCycle: cycleHuman,
-        pinchCyclesTotal: total,
-        captured: this.capturedFlags(),
-      });
+    const span = now - this.raiseSince;
+    if (span >= HAND_UI.RAISE_HOLD_MS) {
+      this.handedness = side;
+      this.onHandednessLock?.(side);
+      this.complete(hold(1, 1), now);
       return;
     }
-
-    this.openMeans.push(mean);
-    if (this.pinchCycle + 1 >= HAND_UI.PINCH_CYCLES) {
-      this.finalizePinchCalib();
-      return;
-    }
-    this.beginPinchCycle(this.pinchCycle + 1);
+    this.emit(this.instruction(now), hold(span, HAND_UI.RAISE_HOLD_MS));
   }
 
-  private pinchPhaseProgress(dwellInStep: number): number {
-    // Framing = 0..0.15; pinch calib = 0.15..0.45; corners = 0.45..1
-    const totalSteps = HAND_UI.PINCH_CYCLES * 2;
-    const stepIndex = this.pinchCycle * 2 + (this.step === 'open' ? 1 : 0);
-    const base = stepIndex / totalSteps;
-    const within = dwellInStep / totalSteps;
-    return 0.15 + (base + within) * 0.3;
+  /**
+   * A rep: the ratio drops below PINCH_REP_CLOSE × your open hand, then comes
+   * back above PINCH_REP_OPEN × the same open value.
+   */
+  private handlePinch(frame: HandFrameEvent, now: number): void {
+    const target = HAND_UI.PINCH_REPS;
+    const ratio = frame.pinchRatio;
+    if (frame.side !== this.handedness || ratio === null) {
+      this.repOpen = null;
+      this.repMin = Infinity;
+      this.emit('Hold your hand up, palm toward the camera', reps(this.reps.length, target));
+      return;
+    }
+
+    this.openWindow.push({ t: now, ratio });
+    while (this.openWindow.length > 0 && now - this.openWindow[0]!.t > HAND_UI.PINCH_OPEN_WINDOW_MS) {
+      this.openWindow.shift();
+    }
+
+    if (this.repOpen === null) {
+      const open = Math.max(...this.openWindow.map((s) => s.ratio));
+      if (ratio < open * HAND_UI.PINCH_REP_CLOSE) {
+        this.repOpen = open;
+        this.repMin = ratio;
+      }
+    } else {
+      this.repMin = Math.min(this.repMin, ratio);
+      if (ratio > this.repOpen * HAND_UI.PINCH_REP_OPEN) {
+        this.reps.push({ closed: this.repMin, open: this.repOpen });
+        this.repOpen = null;
+        this.repMin = Infinity;
+        if (this.reps.length >= target) {
+          this.finishPinch(now);
+          return;
+        }
+      }
+    }
+    this.emit(this.instruction(now), reps(this.reps.length, target));
   }
 
-  private finalizePinchCalib(): void {
-    const closedMean = this.mean(this.closedMeans);
-    const openMean = this.mean(this.openMeans);
-    const contrast = openMean - closedMean;
-
+  private finishPinch(now: number): void {
+    const target = HAND_UI.PINCH_REPS;
+    const closed = mean(this.reps.map((r) => r.closed));
+    const open = mean(this.reps.map((r) => r.open));
+    const contrast = open - closed;
     if (!(contrast >= HAND_UI.PINCH_MIN_CONTRAST)) {
-      this.step = 'rejected';
-      this.closedMeans = [];
-      this.openMeans = [];
-      this.emitUpdate({
-        phase: 'rejected',
-        instruction:
-          'Could not tell pinch from open. Try a clearer pinch vs fully open hand, then Retry.',
-        progress: 0.15,
-        captured: this.capturedFlags(),
-      });
+      this.enter('pinch', now);
+      this.hintOverride = 'Pinch tighter, then open wide';
+      this.emit(this.instruction(now), reps(0, target));
       return;
     }
-
-    this.pinchClose =
-      closedMean + (openMean - closedMean) * HAND_UI.PINCH_CLOSE_LERP;
-    this.pinchOpen =
-      closedMean + (openMean - closedMean) * HAND_UI.PINCH_OPEN_LERP;
-    if (this.pinchOpen <= this.pinchClose) {
-      this.pinchOpen = this.pinchClose + contrast * 0.15;
-    }
-
+    this.pinchClose = closed + contrast * HAND_UI.PINCH_CLOSE_LERP;
+    this.pinchOpen = closed + contrast * HAND_UI.PINCH_OPEN_LERP;
     this.onPinchThresholds?.(this.pinchClose, this.pinchOpen);
-    this.beginCorner('tl');
+    this.complete(reps(target, target), now);
   }
 
-  private beginPinchCycle(cycle: number): void {
-    this.pinchCycle = cycle;
-    this.step = 'pinch';
-    this.sampleStartedAt = 0;
-    this.ratioSamples = [];
-    // Truncate means if restarting mid-way
-    this.closedMeans = this.closedMeans.slice(0, cycle);
-    this.openMeans = this.openMeans.slice(0, cycle);
-
-    const cycleHuman = cycle + 1;
-    this.emitUpdate({
-      phase: 'pinch',
-      instruction: `PINCH and hold (${cycleHuman}/${HAND_UI.PINCH_CYCLES})`,
-      progress: this.pinchPhaseProgress(0),
-      pinchProgress: 0,
-      pinchCycle: cycleHuman,
-      pinchCyclesTotal: HAND_UI.PINCH_CYCLES,
-      captured: this.capturedFlags(),
-    });
+  private instruction(now: number): string {
+    if (this.hintOverride) return this.hintOverride;
+    const late = now - this.stepStartedAt >= CALIBRATION.HINT_AFTER_MS;
+    switch (this.step) {
+      case 'raise':
+        return late ? 'Lift your hand above your elbow' : 'Raise the hand you will use for menus';
+      case 'pinch':
+        return late
+          ? 'Touch thumb and index fingertip, then open wide'
+          : 'Pinch twice — fingers together, then open';
+      default:
+        return 'Hand controls ready';
+    }
   }
 
-  private mean(values: number[]): number {
-    if (values.length === 0) return 0;
-    return values.reduce((a, b) => a + b, 0) / values.length;
+  private enter(step: HandCalibrationStep, now: number): void {
+    this.step = step;
+    this.stepStartedAt = now;
+    this.hintOverride = null;
+    this.raiseSide = null;
+    this.openWindow = [];
+    this.repOpen = null;
+    this.repMin = Infinity;
+    this.reps = [];
+    this.emit(this.instruction(now), step === 'pinch' ? reps(0, HAND_UI.PINCH_REPS) : hold(0, 1));
   }
 
-  private noteHandedness(label: Handedness): void {
-    this.handednessVotes[label] = (this.handednessVotes[label] ?? 0) + 1;
+  /** Show the finished step (full bar or all dots) briefly, then move on. */
+  private complete(feedback: CalibrationFeedback, now: number): void {
+    this.completeUntil = now + CALIBRATION.SUCCESS_BEAT_MS;
+    this.completeFeedback = feedback;
+    this.emit('Nice!', feedback);
   }
 
-  private majorityHandedness(): Handedness {
-    const left = this.handednessVotes.Left ?? 0;
-    const right = this.handednessVotes.Right ?? 0;
-    if (this.lockedHandedness) return this.lockedHandedness;
-    return right > left ? 'Right' : 'Left';
-  }
-
-  private emitCorner(corner: HandCornerId, pinchProgress: number): void {
-    const index = CORNER_ORDER.indexOf(corner);
-    this.emitUpdate({
-      phase: 'corner',
-      corner,
-      cornerIndex: index,
-      instruction: `Pinch and hold at the ${CORNER_LABEL[corner]} of your interaction area.`,
-      progress: 0.45 + ((index + Math.min(1, pinchProgress)) / CORNER_ORDER.length) * 0.55,
-      pinchProgress,
-      captured: this.capturedFlags(),
-    });
-  }
-
-  private advanceAfterCorner(corner: HandCornerId): void {
-    const index = CORNER_ORDER.indexOf(corner);
-    if (index < CORNER_ORDER.length - 1) {
-      this.beginCorner(CORNER_ORDER[index + 1]!);
+  private advance(now: number): void {
+    const next = STEPS[STEPS.indexOf(this.step) + 1];
+    if (next) {
+      this.enter(next, now);
       return;
     }
-
-    const full = this.corners as HandCorners;
-    const error = validateHandCorners(full);
-    if (error) {
-      this.step = 'rejected';
-      this.emitUpdate({
-        phase: 'rejected',
-        instruction: error,
-        progress: 0.45,
-        captured: this.capturedFlags(),
-      });
-      return;
-    }
-
     this.finish({
       version: HAND_UI.PROFILE_VERSION,
-      corners: {
-        tl: { ...full.tl },
-        tr: { ...full.tr },
-        br: { ...full.br },
-        bl: { ...full.bl },
-      },
-      handedness: this.majorityHandedness(),
+      handedness: this.handedness ?? 'Right',
       pinchClose: this.pinchClose,
       pinchOpen: this.pinchOpen,
       createdAt: Date.now(),
     });
   }
 
-  private beginCorner(corner: HandCornerId): void {
-    this.step = corner;
-    this.cursorSamples = [];
-    this.waitingRelease = false;
-    this.emitCorner(corner, 0);
-  }
-
-  private nextMissingCorner(): HandCornerId | null {
-    for (const id of CORNER_ORDER) {
-      if (!this.corners[id]) return id;
-    }
-    return null;
-  }
-
-  private capturedFlags(): Partial<Record<HandCornerId, boolean>> {
-    return {
-      tl: !!this.corners.tl,
-      tr: !!this.corners.tr,
-      br: !!this.corners.br,
-      bl: !!this.corners.bl,
-    };
-  }
-
-  private emitUpdate(update: HandCalibrationUpdate): void {
-    this.bus.emit('handCalibration', update);
+  private emit(instruction: string, feedback: CalibrationFeedback): void {
+    this.bus.emit('handCalibration', {
+      step: this.step,
+      stepIndex: this.step === 'done' ? STEPS.length : Math.max(0, STEPS.indexOf(this.step)),
+      stepTotal: STEPS.length,
+      instruction,
+      feedback,
+    });
   }
 
   private finish(profile: HandProfile | null): void {
     const cb = this.onComplete;
     if (profile) {
       this.step = 'done';
-      this.emitUpdate({
-        phase: 'done',
-        instruction: 'Hand UI setup complete!',
-        progress: 1,
-        captured: { tl: true, tr: true, br: true, bl: true },
-      });
+      this.emit('Hand controls ready', hold(1, 1));
     }
     this.stopInternal(true);
     cb?.(profile);
@@ -450,6 +251,7 @@ export class HandCalibrator {
 
   private stopInternal(clearCallbacks: boolean): void {
     this.active = false;
+    this.completeUntil = null;
     this.unsubscribeFrame?.();
     this.unsubscribeFrame = null;
     if (clearCallbacks) {
@@ -458,4 +260,16 @@ export class HandCalibrator {
       this.onHandednessLock = null;
     }
   }
+}
+
+function hold(value: number, target: number): CalibrationFeedback {
+  return { kind: 'hold', value: Math.max(0, value), target };
+}
+
+function reps(value: number, target: number): CalibrationFeedback {
+  return { kind: 'reps', value, target };
+}
+
+function mean(values: number[]): number {
+  return values.reduce((a, b) => a + b, 0) / Math.max(1, values.length);
 }

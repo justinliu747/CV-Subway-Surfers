@@ -1,12 +1,16 @@
-import { PHYSICS, PLAYER, RUN } from '../config/GameConfig';
+import { JUDGE, PHYSICS, PLAYER, POSE_GATE, RUN, STAMINA } from '../config/GameConfig';
+import { SoundManager } from '../audio/SoundManager';
 import { EventBus } from '../core/EventBus';
-import type { GameEvents, GameState, GestureEvent, Lane, LaneGuides } from '../core/types';
+import { commitHighScore, loadHighScore } from '../core/HighScore';
+import type { GameEvents, GameState, GestureEvent, Lane } from '../core/types';
+import { CoinManager } from './CoinManager';
 import { ObstacleManager } from './ObstacleManager';
 import { GameRenderer } from '../graphics/GameRenderer';
 import { KeyboardSource } from '../input/KeyboardSource';
+import type { ObstacleHandle } from '../physics/PhysicsEngine';
 import { PhysicsEngine } from '../physics/PhysicsEngine';
 import { CalibrationScreen } from '../ui/CalibrationScreen';
-import { HandCalibrationScreen } from '../ui/HandCalibrationScreen';
+import { DebugOverlay } from '../ui/DebugOverlay';
 import { HandCursorOverlay } from '../ui/HandCursorOverlay';
 import { HandUiController } from '../ui/HandUiController';
 import { HUD } from '../ui/HUD';
@@ -38,10 +42,12 @@ export class GameEngine {
   private renderer: GameRenderer | null = null;
   private physics: PhysicsEngine | null = null;
   private obstacles: ObstacleManager | null = null;
+  private coins: CoinManager | null = null;
+  private sound: SoundManager | null = null;
   private hud: HUD | null = null;
   private startScreen: StartScreen | null = null;
   private calibrationScreen: CalibrationScreen | null = null;
-  private handCalibrationScreen: HandCalibrationScreen | null = null;
+  private handCalibrationScreen: CalibrationScreen | null = null;
   private handCursor: HandCursorOverlay | null = null;
   private handUi: HandUiController | null = null;
   private keyboard: KeyboardSource | null = null;
@@ -50,14 +56,17 @@ export class GameEngine {
   private calibrator: PoseCalibrator | null = null;
   private handCalibrator: HandCalibrator | null = null;
   private skeleton: SkeletonOverlay | null = null;
-  private playerMesh: THREE.Mesh | null = null;
+  private playerMesh: THREE.Object3D | null = null;
+  private guardMesh: THREE.Object3D | null = null;
   private profile: PoseProfile | null = null;
   private handProfile: HandProfile | null = null;
   private cameraStream: MediaStream | null = null;
 
   private state: GameState = 'BOOTING';
   private score = 0;
+  private highScore = 0;
   private runSpeed: number = RUN.START_SPEED;
+  private runDistance = 0;
   private currentLane: Lane = 0;
   private accumulator = 0;
   private lastTime = 0;
@@ -67,10 +76,29 @@ export class GameEngine {
   private cameraStarting: Promise<void> | null = null;
   private poseStarting: Promise<void> | null = null;
   private handsStarting: Promise<void> | null = null;
-  private validationHooked = false;
   private duckVisual = 0;
-  private latestLaneGuides: LaneGuides | null = null;
-  private latestHighlightLane: Lane | null = null;
+  private runBob = 0;
+
+  /** True while playing with motion controls (stamina enabled). */
+  private motionMode = false;
+  private poseRunActive = false;
+  private idleMs: number = STAMINA.IDLE_MS;
+  private catchElapsed = 0;
+  private gameOverReason: 'obstacle' | 'caught' | 'pose' = 'obstacle';
+
+  /** Action times (performance.now) for the obstacle judgment windows. */
+  private lastJumpAt = -Infinity;
+  private lastCrouchAt = -Infinity;
+  private lastStarJumpAt = -Infinity;
+  private lastActionAt = -Infinity;
+  private poseCrouchDepth = 0;
+  private poseCrouchActive = false;
+  private poseCrouchSince = 0;
+  private poseCrouchSounded = false;
+  /** Hits held open for JUDGE.LATE_MS before they end the run. */
+  private pendingHits: Array<{ obstacle: ObstacleHandle; at: number }> = [];
+  private starPose = false;
+  private starPoseSince = 0;
 
   constructor(opts: {
     container: HTMLElement;
@@ -93,29 +121,48 @@ export class GameEngine {
   async init(): Promise<void> {
     this.profile = loadProfile();
     this.handProfile = loadHandProfile();
+    this.highScore = loadHighScore();
+    this.sound = new SoundManager();
 
     this.hud = new HUD(this.hudRoot);
-    this.hud.onRestart(() => this.restart());
-    this.hud.onMainMenu(() => this.returnToMenu());
+    this.hud.onRestart(() => {
+      this.sound?.unlock();
+      this.restart();
+    });
+    this.hud.onMainMenu(() => {
+      this.sound?.unlock();
+      this.returnToMenu();
+    });
 
     this.startScreen = new StartScreen(this.uiRoot);
     this.calibrationScreen = new CalibrationScreen(this.uiRoot);
-    this.handCalibrationScreen = new HandCalibrationScreen(this.uiRoot);
+    this.handCalibrationScreen = new CalibrationScreen(this.uiRoot, 'Hand controls · ');
     this.handCursor = new HandCursorOverlay(this.uiRoot);
     this.handUi = new HandUiController(this.bus, this.handCursor);
     this.calibrator = new PoseCalibrator(this.bus);
     this.handCalibrator = new HandCalibrator(this.bus);
+    const debug = new DebugOverlay(this.uiRoot, this.bus, () => this.profile);
 
-    this.startScreen.onPlayKeyboard(() => this.beginRun('keyboard'));
-    this.startScreen.onPlayMotion(() => void this.beginMotionPlay());
-    this.startScreen.onOpenCalibrate(() => void this.beginCalibration());
-    this.startScreen.onOpenHandUi(() => void this.beginHandCalibration());
+    this.startScreen.onPlayKeyboard(() => {
+      this.sound?.unlock();
+      this.beginRun('keyboard');
+    });
+    this.startScreen.onPlayMotion(() => {
+      this.sound?.unlock();
+      void this.beginMotionPlay();
+    });
+    this.startScreen.onOpenCalibrate(() => {
+      this.sound?.unlock();
+      void this.beginCalibration();
+    });
+    this.startScreen.onOpenHandUi(() => {
+      this.sound?.unlock();
+      void this.beginHandCalibration();
+    });
+    this.startScreen.onOpenDebug(() => debug.show());
 
-    this.calibrationScreen.onRetryStep(() => this.calibrator?.retryCurrentStep());
-    this.calibrationScreen.onSkipStep(() => this.calibrator?.skip());
     this.calibrationScreen.onCancelCalib(() => this.calibrator?.cancel());
 
-    this.handCalibrationScreen.onRedoStep(() => this.handCalibrator?.redoLastCorner());
     this.handCalibrationScreen.onCancelCalib(() => this.handCalibrator?.cancel());
 
     this.setCameraStage('hidden');
@@ -129,18 +176,24 @@ export class GameEngine {
     await physics.init();
     this.physics = physics;
 
-    physics.onPlayerHit(() => {
+    physics.onPlayerHit((obstacle) => {
       if (this.state !== 'RUNNING') return;
       if (performance.now() < this.hitGraceUntil) return;
-      this.setState('GAME_OVER');
-      this.syncHandTracking();
+      this.handleObstacleHit(obstacle);
     });
 
     const playerMesh = renderer.createPlayerMesh();
     renderer.add(playerMesh);
     this.playerMesh = playerMesh;
 
+    const guardMesh = renderer.createGuardMesh();
+    renderer.add(guardMesh);
+    this.guardMesh = guardMesh;
+
     this.obstacles = new ObstacleManager(physics, renderer);
+    this.coins = new CoinManager(physics, renderer);
+    this.obstacles.setCoinManager(this.coins);
+    this.coins.onCollect((points) => this.handleCoinCollect(points));
 
     this.keyboard = new KeyboardSource(this.bus);
     await this.keyboard.start();
@@ -148,29 +201,20 @@ export class GameEngine {
     this.unsubscribers.push(
       this.bus.on('gesture', (event) => this.handleGesture(event)),
       this.bus.on('poseLane', ({ lane }) => this.handlePoseLane(lane)),
+      this.bus.on('poseRun', ({ active }) => {
+        this.poseRunActive = active;
+      }),
+      this.bus.on('poseJump', () => this.handlePoseJump()),
+      this.bus.on('poseCrouch', ({ active, depth01 }) => this.handlePoseCrouch(active, depth01)),
+      this.bus.on('poseStarJump', () => this.handleStarJump()),
       this.bus.on('status', ({ text }) => this.hud?.setStatus(text)),
       this.bus.on('calibration', (update) => {
         this.calibrationScreen?.update(update);
-        this.latestLaneGuides = update.laneGuides ?? null;
-        this.latestHighlightLane = update.highlightLane ?? null;
-        this.skeleton?.setLaneGuides(this.latestLaneGuides, this.latestHighlightLane);
-
-        if (update.phase === 'validate' && !this.validationHooked) {
-          this.validationHooked = true;
-          this.calibrator?.beginValidation((enabled) => {
-            if (enabled) {
-              const draft = this.calibrator?.draftProfile();
-              if (draft) this.pose?.setProfile(draft);
-            }
-            this.pose?.setDetectionEnabled(enabled);
-          });
-        }
       }),
       this.bus.on('handCalibration', (update) => {
         this.handCalibrationScreen?.update(update);
       }),
       this.bus.on('poseFrame', ({ landmarks }) => {
-        this.skeleton?.setLaneGuides(this.latestLaneGuides, this.latestHighlightLane);
         this.skeleton?.draw(landmarks);
       }),
     );
@@ -190,12 +234,17 @@ export class GameEngine {
 
     this.physics.setHitsEnabled(false);
     this.obstacles.reset();
+    this.coins?.reset();
     this.physics.reset();
     this.score = 0;
     this.runSpeed = RUN.START_SPEED;
+    this.runDistance = 0;
     this.currentLane = 0;
     this.accumulator = 0;
     this.duckVisual = 0;
+    this.runBob = 0;
+    this.resetStaminaAndPose();
+    this.hideGuard();
     this.hitGraceUntil = performance.now() + 750;
     this.hud.setScore(0);
     if (this.playerMesh) this.playerMesh.scale.set(1, 1, 1);
@@ -203,20 +252,28 @@ export class GameEngine {
     this.syncHandTracking();
     this.physics.setHitsEnabled(true);
     this.setCameraStage(this.cameraStream ? 'corner' : 'hidden');
+    this.hud.setStaminaVisible(this.motionMode);
     this.updateStatusLine('Running');
   }
 
   returnToMenu(): void {
     this.physics?.setHitsEnabled(false);
     this.obstacles?.reset();
+    this.coins?.reset();
     this.physics?.reset();
     this.score = 0;
     this.runSpeed = RUN.START_SPEED;
+    this.runDistance = 0;
     this.currentLane = 0;
     this.accumulator = 0;
     this.duckVisual = 0;
+    this.runBob = 0;
+    this.motionMode = false;
+    this.resetStaminaAndPose();
+    this.hideGuard();
     if (this.playerMesh) this.playerMesh.scale.set(1, 1, 1);
     this.hud?.setScore(0);
+    this.hud?.setStaminaVisible(false);
     this.pose?.setDetectionEnabled(false);
     this.showStartMenu();
   }
@@ -234,7 +291,9 @@ export class GameEngine {
     this.hands?.stop();
     this.stopCamera();
     this.obstacles?.reset();
+    this.coins?.reset();
     this.physics?.dispose();
+    this.sound?.dispose();
     this.renderer?.dispose();
     this.bus.clear();
   }
@@ -244,15 +303,13 @@ export class GameEngine {
     this.handCalibrationScreen?.hide();
     this.setCameraStage(this.cameraStream ? 'corner' : 'hidden');
     this.skeleton?.setVisible(false);
-    this.skeleton?.setLaneGuides(null, null);
-    this.latestLaneGuides = null;
-    this.latestHighlightLane = null;
     this.setState('START_MENU');
     this.startScreen?.show({
       backend: this.renderer?.backendName ?? '?',
       hasProfile: !!this.profile || hasSavedProfile(),
       hasHandProfile: !!this.handProfile || hasHandProfile(),
       handControlsActive: !!this.hands?.isEnabled(),
+      highScore: this.highScore,
     });
     this.hud?.setStatus(`Backend: ${this.renderer?.backendName ?? '?'} · Choose a play mode`);
     this.syncHandTracking();
@@ -263,22 +320,29 @@ export class GameEngine {
     this.calibrationScreen?.hide();
     this.handCalibrationScreen?.hide();
     this.obstacles?.reset();
+    this.coins?.reset();
     this.physics?.reset();
     this.score = 0;
     this.runSpeed = RUN.START_SPEED;
+    this.runDistance = 0;
     this.currentLane = 0;
     this.accumulator = 0;
     this.duckVisual = 0;
+    this.runBob = 0;
+    this.motionMode = mode === 'motion';
+    this.resetStaminaAndPose();
+    this.hideGuard();
     if (this.playerMesh) this.playerMesh.scale.set(1, 1, 1);
     this.hitGraceUntil = performance.now() + 500;
     this.hud?.setScore(0);
+    this.hud?.setStaminaVisible(this.motionMode);
+    if (this.motionMode) this.hud?.setStamina(1);
 
     if (mode === 'motion' && this.pose && this.profile) {
       this.pose.setProfile(this.profile);
       this.pose.setDetectionEnabled(true);
       this.setCameraStage('corner');
       this.skeleton?.setVisible(false);
-      this.skeleton?.setLaneGuides(null, null);
     } else {
       this.pose?.setDetectionEnabled(false);
       this.setCameraStage(this.cameraStream ? 'corner' : 'hidden');
@@ -320,12 +384,8 @@ export class GameEngine {
     this.startScreen?.hide();
     this.handCalibrationScreen?.hide();
     this.pose.setDetectionEnabled(false);
-    this.validationHooked = false;
-    this.latestLaneGuides = null;
-    this.latestHighlightLane = null;
     this.setCameraStage('center');
     this.skeleton?.setVisible(true);
-    this.skeleton?.setLaneGuides(null, null);
     this.setState('CALIBRATING');
     this.calibrationScreen.show();
     this.syncHandTracking();
@@ -333,9 +393,6 @@ export class GameEngine {
     this.calibrator.start((profile) => {
       this.pose?.setDetectionEnabled(false);
       this.skeleton?.setVisible(false);
-      this.skeleton?.setLaneGuides(null, null);
-      this.latestLaneGuides = null;
-      this.latestHighlightLane = null;
       this.calibrationScreen?.hide();
 
       if (profile) {
@@ -373,6 +430,7 @@ export class GameEngine {
         hasProfile: !!this.profile || hasSavedProfile(),
         hasHandProfile: true,
         handControlsActive: !!this.hands?.isEnabled(),
+        highScore: this.highScore,
       });
       this.hud?.setStatus('Hand controls enabled for menus');
       return;
@@ -391,8 +449,9 @@ export class GameEngine {
     this.startScreen?.hide();
     this.calibrationScreen?.hide();
     this.pose?.setDetectionEnabled(false);
-    this.skeleton?.setVisible(false);
-    // Fresh recalibration: drop previous hand/pinch/corner mapping entirely.
+    // The skeleton shows which wrist the cursor will follow.
+    this.skeleton?.setVisible(true);
+    // Fresh setup: drop the previous hand and pinch thresholds.
     this.hands.setProfile(null);
     this.hands.clearSessionHandedness();
     this.setCameraStage('center');
@@ -403,6 +462,7 @@ export class GameEngine {
     this.handCalibrator.start(
       (profile) => {
         this.handCalibrationScreen?.hide();
+        this.skeleton?.setVisible(false);
 
         if (profile) {
           this.handProfile = profile;
@@ -440,6 +500,7 @@ export class GameEngine {
 
     const wantHands =
       this.state !== 'RUNNING' &&
+      this.state !== 'CATCHING' &&
       this.hands !== null &&
       (inHandSetup || (menuLike && !!this.handProfile));
 
@@ -473,6 +534,7 @@ export class GameEngine {
           facingMode: 'user',
           width: { ideal: 640 },
           height: { ideal: 480 },
+          frameRate: { ideal: 60 },
         },
       });
       this.cameraStream = stream;
@@ -505,6 +567,7 @@ export class GameEngine {
 
     this.poseStarting = (async () => {
       const tracker = new PoseTracker(this.video, this.bus);
+      tracker.setHandSideSource(() => this.hands?.requestedHand() ?? null);
       if (this.profile) tracker.setProfile(this.profile);
       await tracker.start();
       this.pose = tracker;
@@ -519,8 +582,9 @@ export class GameEngine {
     }
   }
 
+  /** The hand cursor follows the body tracker's wrist, so pose tracking starts too. */
   private async ensureHandsStarted(): Promise<void> {
-    await this.ensureCameraStarted();
+    await this.ensurePoseStarted();
     if (this.hands) return;
     if (this.handsStarting) {
       await this.handsStarting;
@@ -528,7 +592,7 @@ export class GameEngine {
     }
 
     this.handsStarting = (async () => {
-      const tracker = new HandTracker(this.video, this.bus);
+      const tracker = new HandTracker(this.bus);
       if (this.handProfile) tracker.setProfile(this.handProfile);
       await tracker.start();
       this.hands = tracker;
@@ -553,6 +617,230 @@ export class GameEngine {
     this.hud?.setStatus(`Backend: ${backend} · Input: ${input}${extra}`);
   }
 
+  private handleCoinCollect(points: number): void {
+    if (this.state !== 'RUNNING') return;
+    this.score += points;
+    this.hud?.setScore(this.score);
+    this.bus.emit('coin', { value: points, total: this.score });
+    this.bus.emit('score', { value: this.score });
+    this.sound?.playCoin();
+  }
+
+  private handleObstacleHit(obstacle: ObstacleHandle): void {
+    const now = performance.now();
+    if (this.motionMode) {
+      // Body and camera delay: give the needed action a short window to land.
+      this.pendingHits.push({ obstacle, at: now });
+      this.resolvePendingHits(now);
+      return;
+    }
+    if (obstacle.kind === 'poseStar' && this.actionCovers('poseStar', now)) {
+      this.obstacles?.clearObstacle(obstacle.id);
+      this.sound?.playCoin();
+      return;
+    }
+    this.gameOverReason = obstacle.kind === 'poseStar' ? 'pose' : 'obstacle';
+    this.handleGameOver();
+  }
+
+  /** Did the action this obstacle needs happen in its window around the hit time? */
+  private actionCovers(kind: ObstacleHandle['kind'], hitAt: number): boolean {
+    switch (kind) {
+      case 'high':
+        return this.lastJumpAt >= hitAt - JUDGE.JUMP_EARLY_MS;
+      case 'low':
+        return this.lastCrouchAt >= hitAt - JUDGE.CROUCH_EARLY_MS || !!this.physics?.isDucking();
+      case 'poseStar':
+        return this.lastStarJumpAt >= hitAt - JUDGE.STAR_EARLY_MS;
+    }
+  }
+
+  private resolvePendingHits(now: number): void {
+    if (this.pendingHits.length === 0) return;
+    const open: typeof this.pendingHits = [];
+    for (const hit of this.pendingHits) {
+      if (this.actionCovers(hit.obstacle.kind, hit.at)) {
+        this.obstacles?.clearObstacle(hit.obstacle.id);
+        if (hit.obstacle.kind === 'poseStar') this.sound?.playCoin();
+        continue;
+      }
+      if (now - hit.at >= JUDGE.LATE_MS) {
+        this.pendingHits = [];
+        this.gameOverReason = hit.obstacle.kind === 'poseStar' ? 'pose' : 'obstacle';
+        this.handleGameOver();
+        return;
+      }
+      open.push(hit);
+    }
+    this.pendingHits = open;
+  }
+
+  private handleGameOver(): void {
+    if (this.state === 'GAME_OVER') return;
+    this.hideGuard();
+    const result = commitHighScore(this.score);
+    this.highScore = result.highScore;
+    const messages = {
+      obstacle: { title: 'Game Over', message: 'You hit an obstacle.' },
+      caught: { title: 'Caught!', message: 'Keep running in place!' },
+      pose: { title: 'Game Over', message: 'Star gate: jump with arms and legs out.' },
+    } as const;
+    const copy = messages[this.gameOverReason];
+    this.hud?.setGameOverScores({
+      score: this.score,
+      highScore: result.highScore,
+      isNewHigh: result.isNew,
+      title: copy.title,
+      message: copy.message,
+    });
+    this.sound?.playDeath();
+    this.setState('GAME_OVER');
+    this.syncHandTracking();
+  }
+
+  private beginCatchSequence(): void {
+    if (this.state !== 'RUNNING') return;
+    this.catchElapsed = 0;
+    this.gameOverReason = 'caught';
+    this.runSpeed *= STAMINA.SLOW_FACTOR;
+    if (this.guardMesh && this.playerMesh) {
+      const p = this.physics?.playerPosition() ?? { x: 0, y: PLAYER.START_Y, z: 0 };
+      this.guardMesh.visible = true;
+      this.guardMesh.position.set(p.x + 1.2, 0, p.z + 4);
+    }
+    this.setState('CATCHING');
+    this.syncHandTracking();
+  }
+
+  private updateCatch(dt: number): void {
+    this.catchElapsed += dt * 1000;
+    if (this.guardMesh && this.playerMesh) {
+      const p = this.playerMesh.position;
+      const g = this.guardMesh.position;
+      const t = Math.min(1, this.catchElapsed / STAMINA.CATCH_MS);
+      g.x += (p.x + 0.35 - g.x) * Math.min(1, dt * 6);
+      g.z += (p.z + 0.6 - g.z) * Math.min(1, dt * 6);
+      g.y = 0;
+      // Nudge player slightly
+      this.playerMesh.position.x += (g.x - 0.4 - this.playerMesh.position.x) * t * 0.05;
+    }
+    if (this.catchElapsed >= STAMINA.CATCH_MS) {
+      this.handleGameOver();
+    }
+  }
+
+  private updateStamina(dt: number): void {
+    if (!this.motionMode || this.state !== 'RUNNING') return;
+
+    const recentAction = performance.now() - this.lastActionAt < JUDGE.ACTIVITY_MS;
+    const running = this.poseRunActive || recentAction || this.starPose;
+
+    if (running) {
+      this.idleMs = Math.min(
+        STAMINA.IDLE_MS,
+        this.idleMs + dt * 1000 * STAMINA.REFILL_RATE,
+      );
+    } else {
+      this.idleMs -= dt * 1000;
+      if (this.idleMs <= 0) {
+        this.idleMs = 0;
+        this.beginCatchSequence();
+        return;
+      }
+    }
+
+    this.hud?.setStamina(this.idleMs / STAMINA.IDLE_MS);
+  }
+
+  /** A recent star jump clears the star gate in your lane as it arrives. */
+  private updatePoseGates(): void {
+    if (this.state !== 'RUNNING' || !this.obstacles) return;
+    if (performance.now() - this.lastStarJumpAt > JUDGE.STAR_EARLY_MS) return;
+    for (const gate of this.obstacles.getActivePoseGates()) {
+      if (Math.abs(gate.z) > POSE_GATE.WINDOW_Z) continue;
+      if (gate.lane !== this.currentLane) continue;
+      this.obstacles.clearObstacle(gate.id);
+      this.sound?.playCoin();
+    }
+  }
+
+  private setStarPose(on: boolean): void {
+    if (this.starPose === on) return;
+    this.starPose = on;
+    this.starPoseSince = performance.now();
+    if (this.playerMesh && this.renderer) {
+      this.renderer.applyPlayerStarPose(this.playerMesh, on);
+    }
+  }
+
+  private handlePoseJump(): void {
+    if (this.state !== 'RUNNING' || !this.physics) return;
+    const now = performance.now();
+    this.lastJumpAt = now;
+    this.lastActionAt = now;
+    if (this.physics.jump()) this.sound?.playJump();
+  }
+
+  private handlePoseCrouch(active: boolean, depth01: number): void {
+    if (this.state !== 'RUNNING' || !this.physics) {
+      this.poseCrouchDepth = 0;
+      this.poseCrouchActive = false;
+      return;
+    }
+    this.poseCrouchDepth = depth01;
+    const now = performance.now();
+    if (active) {
+      if (!this.poseCrouchActive) {
+        this.poseCrouchSince = now;
+        this.poseCrouchSounded = false;
+      }
+      // A jump wind-up crouches for a frame or two; only a held duck gets the sound.
+      if (!this.poseCrouchSounded && now - this.poseCrouchSince >= 150) {
+        this.poseCrouchSounded = true;
+        this.sound?.playDuck();
+      }
+      this.lastCrouchAt = now;
+      this.lastActionAt = now;
+    }
+    this.poseCrouchActive = active;
+    this.physics.setCrouch(active);
+  }
+
+  /** Pose star jump or keyboard J: jump with the star shape. */
+  private handleStarJump(): void {
+    if (this.state !== 'RUNNING' || !this.physics) return;
+    const now = performance.now();
+    this.lastStarJumpAt = now;
+    this.lastJumpAt = now;
+    this.lastActionAt = now;
+    if (this.physics.jump()) this.sound?.playJump();
+    this.setStarPose(true);
+    this.updatePoseGates();
+  }
+
+  private resetStaminaAndPose(): void {
+    this.idleMs = STAMINA.IDLE_MS;
+    this.poseRunActive = false;
+    this.catchElapsed = 0;
+    this.gameOverReason = 'obstacle';
+    this.lastJumpAt = -Infinity;
+    this.lastCrouchAt = -Infinity;
+    this.lastStarJumpAt = -Infinity;
+    this.lastActionAt = -Infinity;
+    this.poseCrouchDepth = 0;
+    this.poseCrouchActive = false;
+    this.pendingHits = [];
+    this.physics?.setCrouch(false);
+    this.setStarPose(false);
+    this.hud?.setStamina(1);
+  }
+
+  private hideGuard(): void {
+    if (this.guardMesh) {
+      this.guardMesh.visible = false;
+    }
+  }
+
   private tick(): void {
     const renderer = this.renderer;
     const physics = this.physics;
@@ -575,19 +863,35 @@ export class GameEngine {
       }
 
       this.runSpeed = Math.min(RUN.MAX_SPEED, this.runSpeed + RUN.ACCEL * frameDt);
-      this.score += this.runSpeed * frameDt;
-      this.hud?.setScore(this.score);
-      this.bus.emit('score', { value: this.score });
+      this.runDistance += this.runSpeed * frameDt;
 
-      obstacles.update(frameDt, this.runSpeed);
+      obstacles.update(frameDt, this.runSpeed, this.runDistance);
+      this.coins?.update(frameDt, this.runSpeed);
       renderer.scrollTrack(this.runSpeed * frameDt);
+      this.runBob += frameDt * 10;
+
+      this.resolvePendingHits(now);
+      this.updateStamina(frameDt);
+      this.updatePoseGates();
+    } else if (this.state === 'CATCHING') {
+      physics.updatePlayer(PHYSICS.FIXED_DT);
+      physics.step();
+      obstacles.update(frameDt, this.runSpeed, this.runDistance);
+      renderer.scrollTrack(this.runSpeed * frameDt);
+      this.updateCatch(frameDt);
     } else if (this.state === 'GAME_OVER' || this.state === 'START_MENU') {
       physics.updatePlayer(PHYSICS.FIXED_DT);
       physics.step();
     }
 
-    // Smooth duck visual toward physics duck state.
-    const duckTarget = physics.isDucking() ? 1 : 0;
+    if (this.starPose) {
+      const held = now - this.starPoseSince;
+      if ((held > 250 && physics.isGrounded()) || held > 1500) this.setStarPose(false);
+    }
+
+    // Duck visual follows the physics duck, and in motion mode your crouch depth.
+    const poseDepth = this.motionMode && this.state === 'RUNNING' ? this.poseCrouchDepth : 0;
+    const duckTarget = Math.max(physics.isDucking() ? 1 : 0, poseDepth);
     const duckLerp = 1 - Math.exp(-PLAYER.DUCK_VISUAL_LERP_SPEED * frameDt);
     this.duckVisual += (duckTarget - this.duckVisual) * duckLerp;
 
@@ -598,7 +902,14 @@ export class GameEngine {
   private syncPlayerMesh(): void {
     if (!this.playerMesh || !this.physics) return;
     const p = this.physics.playerPosition();
-    this.playerMesh.position.set(p.x, p.y, p.z);
+    const bob =
+      this.state === 'RUNNING' &&
+      this.duckVisual < 0.2 &&
+      !this.starPose &&
+      p.y < PLAYER.START_Y + 0.15
+        ? Math.sin(this.runBob) * 0.04
+        : 0;
+    this.playerMesh.position.set(p.x, p.y + bob, p.z);
 
     const scaleY = 1 - this.duckVisual * (1 - PLAYER.DUCK_VISUAL_SCALE_Y);
     this.playerMesh.scale.set(1, scaleY, 1);
@@ -607,37 +918,46 @@ export class GameEngine {
   private handlePoseLane(lane: Lane): void {
     // Pose gestures during calibration must not drive gameplay.
     if (this.state !== 'RUNNING' || !this.physics) return;
+    if (lane !== this.currentLane) {
+      this.sound?.playLane();
+    }
     this.currentLane = lane;
     this.physics.setTargetLane(lane);
   }
 
   private handleGesture(event: GestureEvent): void {
     if (this.state === 'GAME_OVER') {
-      if (event.gesture === 'JUMP' && event.source === 'keyboard') {
-        this.restart();
-      }
+      if (event.gesture === 'JUMP') this.restart();
       return;
     }
 
-    // Pose gestures during calibration validation must not drive gameplay.
     if (this.state !== 'RUNNING' || !this.physics) return;
 
     switch (event.gesture) {
-      case 'MOVE_LEFT':
-        this.currentLane = Math.max(-1, this.currentLane - 1) as Lane;
+      case 'MOVE_LEFT': {
+        const next = Math.max(-1, this.currentLane - 1) as Lane;
+        if (next !== this.currentLane) this.sound?.playLane();
+        this.currentLane = next;
         this.physics.setTargetLane(this.currentLane);
         break;
-      case 'MOVE_RIGHT':
-        this.currentLane = Math.min(1, this.currentLane + 1) as Lane;
+      }
+      case 'MOVE_RIGHT': {
+        const next = Math.min(1, this.currentLane + 1) as Lane;
+        if (next !== this.currentLane) this.sound?.playLane();
+        this.currentLane = next;
         this.physics.setTargetLane(this.currentLane);
         break;
+      }
       case 'JUMP':
-        this.physics.jump();
+        if (this.physics.jump()) this.sound?.playJump();
         break;
       case 'DUCK':
+        if (!this.physics.isDucking()) this.sound?.playDuck();
         this.physics.startDuck();
+        this.lastCrouchAt = performance.now();
         break;
-      case 'NEUTRAL':
+      case 'STAR_JUMP':
+        this.handleStarJump();
         break;
     }
   }

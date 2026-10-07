@@ -1,10 +1,16 @@
 import RAPIER from '@dimforge/rapier3d-compat';
-import { OBSTACLES, PHYSICS, PLAYER, TRACK } from '../config/GameConfig';
+import { COIN, OBSTACLES, PHYSICS, PLAYER, TRACK } from '../config/GameConfig';
 import type { Lane, ObstacleKind } from '../core/types';
 
 export interface ObstacleHandle {
   id: number;
   kind: ObstacleKind;
+  body: RAPIER.RigidBody;
+  collider: RAPIER.Collider;
+}
+
+export interface CoinHandle {
+  id: number;
   body: RAPIER.RigidBody;
   collider: RAPIER.Collider;
 }
@@ -17,10 +23,17 @@ export class PhysicsEngine {
 
   private targetLane: Lane = 0;
   private duckRemainingMs = 0;
+  /** Pose crouch: ducked for exactly as long as the player stays down. */
+  private crouchHeld = false;
+  private duckShapeApplied = false;
   private nextObstacleId = 1;
+  private nextCoinId = 1;
   private readonly obstaclesByCollider = new Map<number, ObstacleHandle>();
+  private readonly coinsByCollider = new Map<number, CoinHandle>();
   private readonly activeObstacles = new Set<ObstacleHandle>();
+  private readonly activeCoins = new Set<CoinHandle>();
   private hitCallback: ((obstacle: ObstacleHandle) => void) | null = null;
+  private coinCallback: ((coin: CoinHandle) => void) | null = null;
   private standingHalfHeight = PLAYER.HALF_HEIGHT;
   private hitsEnabled = true;
 
@@ -55,6 +68,12 @@ export class PhysicsEngine {
       else if (h2 === playerHandle) other = h1;
       else return;
 
+      const coin = this.coinsByCollider.get(other);
+      if (coin) {
+        this.coinCallback?.(coin);
+        return;
+      }
+
       if (!this.hitsEnabled) return;
       const obstacle = this.obstaclesByCollider.get(other);
       if (obstacle) {
@@ -69,6 +88,10 @@ export class PhysicsEngine {
 
   onPlayerHit(cb: (obstacle: ObstacleHandle) => void): void {
     this.hitCallback = cb;
+  }
+
+  onCoinCollect(cb: (coin: CoinHandle) => void): void {
+    this.coinCallback = cb;
   }
 
   playerPosition(): { x: number; y: number; z: number } {
@@ -91,14 +114,37 @@ export class PhysicsEngine {
     return true;
   }
 
+  /** Keyboard duck: a fixed-length duck. */
   startDuck(): void {
+    this.duckRemainingMs = PLAYER.DUCK_MS;
+    this.applyDuckShape();
+  }
+
+  /** Pose duck: held while `active`. */
+  setCrouch(active: boolean): void {
+    if (this.crouchHeld === active) return;
+    this.crouchHeld = active;
+    this.applyDuckShape();
+  }
+
+  isDucking(): boolean {
+    return this.crouchHeld || this.duckRemainingMs > 0;
+  }
+
+  private applyDuckShape(): void {
     const collider = this.playerCollider;
     const body = this.playerBody;
     if (!collider || !body) return;
+    const ducked = this.isDucking();
+    if (ducked === this.duckShapeApplied) return;
+    this.duckShapeApplied = ducked;
 
-    this.duckRemainingMs = PLAYER.DUCK_MS;
+    if (!ducked) {
+      collider.setHalfHeight(this.standingHalfHeight);
+      return;
+    }
+
     collider.setHalfHeight(PLAYER.DUCK_HALF_HEIGHT);
-
     // Keep feet on the ground when shrinking the capsule.
     // Copy components — Rapier Vectors must not be held across mutating calls.
     const { x, y, z } = body.translation();
@@ -106,10 +152,6 @@ export class PhysicsEngine {
     if (y <= duckedCenterY + 0.05) {
       body.setTranslation({ x, y: duckedCenterY, z }, true);
     }
-  }
-
-  isDucking(): boolean {
-    return this.duckRemainingMs > 0;
   }
 
   updatePlayer(dt: number): void {
@@ -121,7 +163,7 @@ export class PhysicsEngine {
       this.duckRemainingMs -= dt * 1000;
       if (this.duckRemainingMs <= 0) {
         this.duckRemainingMs = 0;
-        collider.setHalfHeight(this.standingHalfHeight);
+        this.applyDuckShape();
       }
     }
 
@@ -148,7 +190,12 @@ export class PhysicsEngine {
       throw new Error('PhysicsEngine not initialized');
     }
 
-    const spec = kind === 'high' ? OBSTACLES.HIGH : OBSTACLES.LOW;
+    const spec =
+      kind === 'high'
+        ? OBSTACLES.HIGH
+        : kind === 'low'
+          ? OBSTACLES.LOW
+          : OBSTACLES.POSE_GATE;
     const x = lane * TRACK.LANE_WIDTH;
     const y = spec.centreY;
 
@@ -189,10 +236,56 @@ export class PhysicsEngine {
     world.removeRigidBody(o.body);
   }
 
-  /** Resets player pose/state only. Obstacle lifecycle is owned by ObstacleManager. */
+  spawnCoin(lane: Lane, z: number): CoinHandle {
+    const world = this.world;
+    if (!world) {
+      throw new Error('PhysicsEngine not initialized');
+    }
+
+    const x = lane * TRACK.LANE_WIDTH;
+    const y = COIN.CENTRE_Y;
+
+    const body = world.createRigidBody(
+      RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(x, y, z),
+    );
+    const collider = world.createCollider(
+      RAPIER.ColliderDesc.ball(COIN.RADIUS)
+        .setSensor(true)
+        .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS),
+      body,
+    );
+
+    const handle: CoinHandle = {
+      id: this.nextCoinId++,
+      body,
+      collider,
+    };
+    this.coinsByCollider.set(collider.handle, handle);
+    this.activeCoins.add(handle);
+    return handle;
+  }
+
+  moveCoin(c: CoinHandle, z: number): void {
+    if (!this.activeCoins.has(c)) return;
+    const { x, y } = c.body.translation();
+    c.body.setNextKinematicTranslation({ x, y, z });
+  }
+
+  despawnCoin(c: CoinHandle): void {
+    const world = this.world;
+    if (!world) return;
+    if (!this.activeCoins.has(c)) return;
+    this.coinsByCollider.delete(c.collider.handle);
+    this.activeCoins.delete(c);
+    world.removeRigidBody(c.body);
+  }
+
+  /** Resets player pose/state only. Obstacle/coin lifecycle is owned by managers. */
   reset(): void {
     this.targetLane = 0;
     this.duckRemainingMs = 0;
+    this.crouchHeld = false;
+    this.duckShapeApplied = false;
     this.hitsEnabled = true;
     this.eventQueue?.clear();
 
@@ -209,6 +302,9 @@ export class PhysicsEngine {
     for (const obstacle of [...this.activeObstacles]) {
       this.despawnObstacle(obstacle);
     }
+    for (const coin of [...this.activeCoins]) {
+      this.despawnCoin(coin);
+    }
     this.eventQueue?.free();
     this.eventQueue = null;
     this.world?.free();
@@ -216,6 +312,7 @@ export class PhysicsEngine {
     this.playerBody = null;
     this.playerCollider = null;
     this.hitCallback = null;
+    this.coinCallback = null;
   }
 
   private createPlayer(): void {
@@ -237,15 +334,14 @@ export class PhysicsEngine {
     this.standingHalfHeight = PLAYER.HALF_HEIGHT;
   }
 
-  private isGrounded(): boolean {
+  isGrounded(): boolean {
     const body = this.playerBody;
     const collider = this.playerCollider;
     const world = this.world;
     if (!body || !collider || !world) return false;
 
     const p = body.translation();
-    const halfHeight =
-      this.duckRemainingMs > 0 ? PLAYER.DUCK_HALF_HEIGHT : this.standingHalfHeight;
+    const halfHeight = this.isDucking() ? PLAYER.DUCK_HALF_HEIGHT : this.standingHalfHeight;
     const ray = new RAPIER.Ray({ x: p.x, y: p.y, z: p.z }, { x: 0, y: -1, z: 0 });
     const maxToi = halfHeight + PLAYER.RADIUS + PHYSICS.GROUND_RAY_SKIN;
     const hit = world.castRay(ray, maxToi, true, undefined, undefined, collider);

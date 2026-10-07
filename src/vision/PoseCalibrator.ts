@@ -1,67 +1,77 @@
-import { CALIBRATION, VISION } from '../config/GameConfig';
+import { BODY, CALIBRATION, VISION } from '../config/GameConfig';
 import type { EventBus } from '../core/EventBus';
 import type {
+  BodyFrame,
+  CalibrationFeedback,
   CalibrationStepId,
   CalibrationUpdate,
   GameEvents,
-  Lane,
-  LaneGuides,
   PoseSample,
-  ValidateTarget,
 } from '../core/types';
-import { defaultProfile, laneSignal, type PoseProfile } from './PoseProfile';
+import { BodyState } from './BodyState';
+import { defaultProfile, laneSignal, RunCadence, type PoseProfile } from './PoseProfile';
 
-type CaptureKind = 'lane_left' | 'lane_center' | 'lane_right' | 'jump' | 'duck';
-
-interface CapturePeaks {
-  jump: number;
-  duck: number;
-}
-
-interface LaneCaptures {
-  leftX: number | null;
-  centerX: number | null;
-  rightX: number | null;
-}
-
-const VALIDATE_SEQUENCE: ValidateTarget[] = [
-  'LANE_LEFT',
-  'LANE_CENTER',
-  'LANE_RIGHT',
-  'JUMP',
-  'DUCK',
+const STEPS: CalibrationStepId[] = [
+  'stand',
+  'lane_left',
+  'lane_right',
+  'jump',
+  'duck',
+  'run',
+  'star_jump',
 ];
 
+const FEET_HINT = 'Step back so your feet are visible';
+
+interface StillSample {
+  shoulderY: number;
+  torso: number;
+  noseY: number;
+  hipY: number;
+  floorY: number;
+  lane: number;
+  spread: number;
+}
+
+/**
+ * Seven prompts. Each one ends as soon as its measurement is captured, and
+ * jump, duck, and star jump reps are counted by the same BodyState detectors
+ * the game uses, so a rep that counts here triggers in a run.
+ */
 export class PoseCalibrator {
   private readonly bus: EventBus<GameEvents>;
+  private readonly cadence = new RunCadence();
   private unsubscribeFrame: (() => void) | null = null;
-  private unsubscribeGesture: (() => void) | null = null;
-  private unsubscribeLane: (() => void) | null = null;
   private active = false;
-  private step: CalibrationStepId = 'framing';
-  private framingCount = 0;
-  private neutralCount = 0;
-  private shoulderYSamples: number[] = [];
-  private baseline = defaultProfile().baseline;
-  private peaks: CapturePeaks = { jump: 0, duck: 0 };
-  private lanes: LaneCaptures = { leftX: null, centerX: null, rightX: null };
-  private laneSampleSum = 0;
-  private laneSampleCount = 0;
-  private captureKind: CaptureKind | null = null;
-  private phaseStartedAt = 0;
-  private currentDeviation = 0;
-  private currentPeak = 0;
+  private step: CalibrationStepId = 'stand';
+  private stepStartedAt = 0;
   private onComplete: ((profile: PoseProfile | null) => void) | null = null;
-  private rejectReason = '';
 
-  // Validation state machine
-  private validateIndex = 0;
-  private validateSuccess = false;
-  private validateSuccessUntil = 0;
-  private setDetection: ((enabled: boolean) => void) | null = null;
-  private neutralHoldStartedAt: number | null = null;
-  private laneDwellStartedAt: number | null = null;
-  private gestureListening = false;
+  /** Profile under construction; BodyState reads it from step 2 on. */
+  private profile: PoseProfile = defaultProfile();
+  private body: BodyState | null = null;
+  private idleLevel = 0;
+  private leftX: number | null = null;
+
+  /** Set when a step is done: its final state stays on screen until this time. */
+  private completeUntil: number | null = null;
+  private completeFeedback: CalibrationFeedback | null = null;
+
+  private still: StillSample[] = [];
+  private stillSince: number | null = null;
+
+  private holdStartedAt: number | null = null;
+  private holdAnchor: number | null = null;
+  private holdSum = 0;
+  private holdCount = 0;
+
+  private repValues: number[] = [];
+  private jumpReps: Array<{ foot: number; hip: number }> = [];
+  private starReps: Array<{ arm: number; spread: number }> = [];
+
+  private runHoldStart: number | null = null;
+  private runBelowSince: number | null = null;
+  private runSamples: number[] = [];
 
   constructor(bus: EventBus<GameEvents>) {
     this.bus = bus;
@@ -71,53 +81,17 @@ export class PoseCalibrator {
     this.stopInternal(false);
     this.onComplete = onComplete;
     this.active = true;
-    this.step = 'framing';
-    this.framingCount = 0;
-    this.neutralCount = 0;
-    this.shoulderYSamples = [];
-    this.peaks = { jump: 0, duck: 0 };
-    this.lanes = { leftX: null, centerX: null, rightX: null };
-    this.laneSampleSum = 0;
-    this.laneSampleCount = 0;
-    this.captureKind = null;
-    this.currentDeviation = 0;
-    this.currentPeak = 0;
-    this.rejectReason = '';
-    this.baseline = defaultProfile().baseline;
-    this.resetValidateState();
+    this.profile = defaultProfile();
+    this.body = null;
+    this.idleLevel = 0;
+    this.leftX = null;
 
-    this.unsubscribeFrame = this.bus.on('poseFrame', ({ sample }) => {
-      if (!this.active || !sample) return;
-      this.onSample(sample);
+    this.unsubscribeFrame = this.bus.on('poseFrame', ({ sample, t }) => {
+      if (!this.active) return;
+      this.onFrame(sample, t);
     });
 
-    this.emitUpdate({
-      phase: 'framing',
-      step: 'framing',
-      instruction: 'Stand so your nose, shoulders, and hips are all visible.',
-      progress: 0,
-    });
-  }
-
-  retryCurrentStep(): void {
-    if (!this.active) return;
-    if (this.step === 'rejected' && this.captureKind) {
-      this.beginCountdown(this.captureKind);
-      return;
-    }
-    if (this.isCaptureStep(this.step)) {
-      this.beginCountdown(this.step);
-    }
-  }
-
-  skip(): void {
-    if (!this.active) return;
-    // Skipping validation still keeps the measured profile.
-    if (this.step === 'validate') {
-      this.finish(this.buildProfile());
-      return;
-    }
-    this.finish(null);
+    this.enter('stand');
   }
 
   cancel(): void {
@@ -125,617 +99,497 @@ export class PoseCalibrator {
     this.finish(null);
   }
 
-  /**
-   * Call when entering validation. `setDetection` is two-way so we can
-   * disable detection between targets / during the neutral gate.
-   */
-  beginValidation(setDetection: (enabled: boolean) => void): void {
-    if (!this.active || this.step !== 'validate') return;
-    this.setDetection = setDetection;
-    this.validateIndex = 0;
-    this.validateSuccess = false;
-    this.startValidateTarget();
-  }
+  private onFrame(sample: PoseSample | null, now: number): void {
+    if (this.completeUntil !== null) {
+      if (now < this.completeUntil) {
+        this.emit('Nice!', this.completeFeedback ?? holdFeedback(1, 1));
+        return;
+      }
+      this.completeUntil = null;
+      this.completeFeedback = null;
+      this.advance(now);
+      return;
+    }
 
-  private resetValidateState(): void {
-    this.validateIndex = 0;
-    this.validateSuccess = false;
-    this.validateSuccessUntil = 0;
-    this.setDetection = null;
-    this.neutralHoldStartedAt = null;
-    this.laneDwellStartedAt = null;
-    this.gestureListening = false;
-    this.unsubscribeGesture?.();
-    this.unsubscribeGesture = null;
-    this.unsubscribeLane?.();
-    this.unsubscribeLane = null;
-  }
-
-  private onSample(sample: PoseSample): void {
+    const frame = this.body?.update(sample, now) ?? null;
     switch (this.step) {
-      case 'framing':
-        this.handleFraming(sample);
-        break;
-      case 'neutral':
-        this.handleNeutral(sample);
+      case 'stand':
+        this.handleStand(sample, now);
         break;
       case 'lane_left':
-      case 'lane_center':
       case 'lane_right':
-      case 'jump':
-      case 'duck':
-        this.handleCaptureStep(sample);
+        this.handleLane(sample, now);
         break;
-      case 'validate':
-        this.handleValidateSample(sample);
+      case 'jump':
+        this.handleJump(frame, now);
+        break;
+      case 'duck':
+        this.handleDuck(frame, now);
+        break;
+      case 'run':
+        this.handleRun(sample, now);
+        break;
+      case 'star_jump':
+        this.handleStarJump(frame, now);
         break;
       default:
         break;
     }
   }
 
-  private handleFraming(sample: PoseSample): void {
-    const hipsOk = sample.hipsVisible;
-    if (hipsOk) {
-      this.framingCount += 1;
-    } else {
-      this.framingCount = 0;
+  private handleStand(sample: PoseSample | null, now: number): void {
+    const full =
+      sample &&
+      sample.hipMidY !== null &&
+      sample.footLY !== null &&
+      sample.footRY !== null &&
+      sample.star !== null;
+    if (!full) {
+      this.still = [];
+      this.stillSince = null;
+      this.emit(FEET_HINT, holdFeedback(0, CALIBRATION.STILL_HOLD_MS));
+      return;
     }
 
-    const progress = Math.min(1, this.framingCount / CALIBRATION.FRAMING_FRAMES);
-    const instruction = hipsOk
-      ? 'Hold still — framing looks good…'
-      : 'Step back until your hips are in frame.';
-
-    this.emitUpdate({
-      phase: 'framing',
-      step: 'framing',
-      instruction,
-      progress,
+    const torso = Math.max(0.05, Math.abs(sample.shoulderMidY - sample.hipMidY!));
+    this.cadence.update(sample, torso);
+    if (this.stillSince === null) this.stillSince = now;
+    this.still.push({
+      shoulderY: sample.shoulderMidY,
+      torso,
+      noseY: sample.noseY,
+      hipY: sample.hipMidY!,
+      floorY: (sample.footLY! + sample.footRY!) * 0.5,
+      lane: laneSignal(sample),
+      spread: sample.star!.spread,
     });
 
-    if (this.framingCount >= CALIBRATION.FRAMING_FRAMES) {
-      this.step = 'neutral';
-      this.neutralCount = 0;
-      this.shoulderYSamples = [];
-      this.emitUpdate({
-        phase: 'neutral',
-        step: 'neutral',
-        instruction: 'Stand still in the CENTER lane in a neutral pose.',
-        progress: 0,
-        highlightLane: 0,
-      });
-    }
-  }
-
-  private handleNeutral(sample: PoseSample): void {
-    this.neutralCount += 1;
-    const n = this.neutralCount;
-    const torso =
-      sample.hipMidY !== null
-        ? Math.max(0.05, Math.abs(sample.shoulderMidY - sample.hipMidY))
-        : Math.max(0.05, this.baseline.torsoHeight);
-
-    this.baseline.shoulderY += (sample.shoulderMidY - this.baseline.shoulderY) / n;
-    this.baseline.torsoHeight += (torso - this.baseline.torsoHeight) / n;
-    this.baseline.shoulderWidth += (sample.shoulderWidth - this.baseline.shoulderWidth) / n;
-    this.baseline.noseX += (sample.noseX - this.baseline.noseX) / n;
-    this.baseline.shoulderMidX += (sample.shoulderMidX - this.baseline.shoulderMidX) / n;
-    this.shoulderYSamples.push(sample.shoulderMidY);
-
-    const progress = Math.min(1, n / CALIBRATION.NEUTRAL_FRAMES);
-    this.emitUpdate({
-      phase: 'neutral',
-      step: 'neutral',
-      instruction: 'Stand still in the CENTER lane in a neutral pose.',
-      progress,
-      highlightLane: 0,
-    });
-
-    if (n >= CALIBRATION.NEUTRAL_FRAMES) {
-      this.baseline.noiseStdDev =
-        this.stdDev(this.shoulderYSamples) / Math.max(0.05, this.baseline.torsoHeight);
-      this.beginCountdown('lane_left');
-    }
-  }
-
-  private beginCountdown(kind: CaptureKind): void {
-    this.step = kind;
-    this.captureKind = kind;
-    this.phaseStartedAt = performance.now();
-    this.currentDeviation = 0;
-    this.currentPeak = 0;
-    this.laneSampleSum = 0;
-    this.laneSampleCount = 0;
-    this.rejectReason = '';
-
-    this.emitUpdate({
-      phase: 'countdown',
-      step: kind,
-      instruction: this.instructionFor(kind),
-      progress: 0,
-      countdown: 3,
-      deviation: 0,
-      peak: 0,
-      highlightLane: this.highlightFor(kind),
-    });
-  }
-
-  private handleCaptureStep(sample: PoseSample): void {
-    if (!this.captureKind || this.step !== this.captureKind) return;
-
-    const elapsed = performance.now() - this.phaseStartedAt;
-
-    if (elapsed < CALIBRATION.COUNTDOWN_MS) {
-      const remaining = Math.ceil((CALIBRATION.COUNTDOWN_MS - elapsed) / 1000);
-      this.emitUpdate({
-        phase: 'countdown',
-        step: this.captureKind,
-        instruction: this.instructionFor(this.captureKind),
-        progress: elapsed / CALIBRATION.COUNTDOWN_MS,
-        countdown: Math.max(1, remaining),
-        deviation: 0,
-        peak: this.currentPeak,
-        highlightLane: this.highlightFor(this.captureKind),
-      });
+    const shoulderStd = this.relativeStd((s) => s.shoulderY, (s) => s.torso);
+    if (this.still.length >= 8 && shoulderStd > CALIBRATION.STILL_MAX_STD) {
+      this.still = [this.still[this.still.length - 1]!];
+      this.stillSince = now;
+      this.emit(this.instruction(now), holdFeedback(0, CALIBRATION.STILL_HOLD_MS));
       return;
     }
 
-    const captureElapsed = elapsed - CALIBRATION.COUNTDOWN_MS;
-    if (captureElapsed > CALIBRATION.CAPTURE_MS) {
-      this.finalizeCapture();
+    const span = now - this.stillSince;
+    if (span >= CALIBRATION.STILL_HOLD_MS) {
+      this.commitStand();
+      this.complete(holdFeedback(1, 1), now);
       return;
     }
-
-    if (this.isLaneCapture(this.captureKind)) {
-      const signal = laneSignal(sample);
-      this.laneSampleSum += signal;
-      this.laneSampleCount += 1;
-      this.currentDeviation = signal;
-      this.currentPeak = this.laneSampleCount > 0 ? this.laneSampleSum / this.laneSampleCount : signal;
-
-      this.emitUpdate({
-        phase: 'capture',
-        step: this.captureKind,
-        instruction: `${this.instructionFor(this.captureKind)} — hold the position!`,
-        progress: captureElapsed / CALIBRATION.CAPTURE_MS,
-        deviation: this.currentDeviation,
-        peak: this.currentPeak,
-        highlightLane: this.highlightFor(this.captureKind),
-      });
-      return;
-    }
-
-    const deviation = this.measureDeviation(sample, this.captureKind);
-    this.currentDeviation = Math.abs(deviation);
-    if (deviation > this.currentPeak) {
-      this.currentPeak = deviation;
-    }
-
-    this.emitUpdate({
-      phase: 'capture',
-      step: this.captureKind,
-      instruction: `${this.instructionFor(this.captureKind)} — do it 2–3 times!`,
-      progress: captureElapsed / CALIBRATION.CAPTURE_MS,
-      deviation: this.currentDeviation,
-      peak: Math.abs(this.currentPeak),
-      highlightLane: this.highlightFor(this.captureKind),
-    });
+    this.emit(this.instruction(now), holdFeedback(span, CALIBRATION.STILL_HOLD_MS));
   }
 
-  private finalizeCapture(): void {
-    if (!this.captureKind) return;
+  private commitStand(): void {
+    const mean = (f: (s: StillSample) => number) =>
+      this.still.reduce((sum, s) => sum + f(s), 0) / this.still.length;
+    const floorY = mean((s) => s.floorY);
+    const hipY = mean((s) => s.hipY);
+    const legLength = Math.max(0.05, floorY - hipY);
+    const ankleStd = this.relativeStd((s) => s.floorY, () => legLength);
 
-    if (this.isLaneCapture(this.captureKind)) {
-      this.finalizeLaneCapture();
-      return;
-    }
+    this.profile.baseline = {
+      shoulderY: mean((s) => s.shoulderY),
+      torsoHeight: Math.max(0.05, mean((s) => s.torso)),
+      noseY: mean((s) => s.noseY),
+      hipY,
+      floorY,
+      legLength,
+      ankleNoise: ankleStd,
+      footSpread: mean((s) => s.spread),
+    };
+    this.profile.lanes.centerX = mean((s) => s.lane);
+    this.idleLevel = this.cadence.value;
 
-    const peakAbs = Math.abs(this.currentPeak);
-    const noiseFloor = Math.max(0.005, this.baseline.noiseStdDev);
-    const minPeak = noiseFloor * CALIBRATION.MIN_PEAK_OVER_NOISE;
-
-    if (peakAbs < minPeak) {
-      this.step = 'rejected';
-      this.rejectReason = 'Not enough motion detected. Try a bigger movement.';
-      this.emitUpdate({
-        phase: 'rejected',
-        step: 'rejected',
-        instruction: this.rejectReason,
-        progress: 0,
-        deviation: this.currentDeviation,
-        peak: peakAbs,
-        highlightLane: this.highlightFor(this.captureKind),
-      });
-      return;
-    }
-
-    switch (this.captureKind) {
-      case 'jump':
-        this.peaks.jump = peakAbs;
-        this.beginCountdown('duck');
-        break;
-      case 'duck':
-        this.peaks.duck = peakAbs;
-        this.enterValidate();
-        break;
-    }
+    // Floors low enough that real attempts register while their size is measured.
+    this.profile.thresholds.airLift = this.airLiftFloor();
+    this.profile.thresholds.hipJump = BODY.HIP_JUMP_MIN;
+    this.profile.thresholds.crouch = BODY.CROUCH_MIN;
+    this.profile.thresholds.starArm = BODY.STAR_ARM_MIN;
+    this.profile.thresholds.starSpread = this.starSpreadFloor();
+    this.body = new BodyState(this.profile);
   }
 
-  private finalizeLaneCapture(): void {
-    if (!this.captureKind || !this.isLaneCapture(this.captureKind)) return;
-
-    if (this.laneSampleCount < 5) {
-      this.step = 'rejected';
-      this.rejectReason = 'Could not track your position. Try again.';
-      this.emitUpdate({
-        phase: 'rejected',
-        step: 'rejected',
-        instruction: this.rejectReason,
-        progress: 0,
-        highlightLane: this.highlightFor(this.captureKind),
-      });
+  private handleLane(sample: PoseSample | null, now: number): void {
+    if (!sample) {
+      this.resetLaneHold();
+      this.emit(FEET_HINT, holdFeedback(0, CALIBRATION.LANE_HOLD_MS));
       return;
     }
 
-    const avg = this.laneSampleSum / this.laneSampleCount;
+    const centerX = this.profile.lanes.centerX;
+    const signal = laneSignal(sample);
+    const fromCenter = signal - centerX;
+    const separated = Math.abs(fromCenter) >= CALIBRATION.MIN_LANE_SEPARATION;
+    const sideOk =
+      this.step === 'lane_left' ||
+      (this.leftX !== null && fromCenter * (this.leftX - centerX) < 0);
 
-    // Separation check against previously captured adjacent lanes.
-    const prev = this.previousLaneValue(this.captureKind);
-    if (prev !== null && Math.abs(avg - prev) < CALIBRATION.MIN_LANE_SEPARATION) {
-      this.step = 'rejected';
-      this.rejectReason = 'Not enough separation from the previous lane. Move farther sideways.';
-      this.emitUpdate({
-        phase: 'rejected',
-        step: 'rejected',
-        instruction: this.rejectReason,
-        progress: 0,
-        highlightLane: this.highlightFor(this.captureKind),
-      });
+    if (!separated || !sideOk) {
+      this.resetLaneHold();
+      this.emit(this.instruction(now), holdFeedback(0, CALIBRATION.LANE_HOLD_MS));
       return;
     }
 
-    switch (this.captureKind) {
-      case 'lane_left':
-        this.lanes.leftX = avg;
-        this.beginCountdown('lane_center');
-        break;
-      case 'lane_center':
-        this.lanes.centerX = avg;
-        this.beginCountdown('lane_right');
-        break;
-      case 'lane_right':
-        this.lanes.rightX = avg;
-        this.beginCountdown('jump');
-        break;
-    }
-  }
-
-  private previousLaneValue(kind: CaptureKind): number | null {
-    if (kind === 'lane_center') return this.lanes.leftX;
-    if (kind === 'lane_right') return this.lanes.centerX;
-    return null;
-  }
-
-  private enterValidate(): void {
-    this.step = 'validate';
-    this.validateIndex = 0;
-    this.validateSuccess = false;
-    this.emitValidateUpdate('Move into the LEFT lane and hold.');
-    // GameEngine hooks beginValidation on the first validate-phase update.
-  }
-
-  private startValidateTarget(): void {
-    this.unsubscribeGesture?.();
-    this.unsubscribeGesture = null;
-    this.unsubscribeLane?.();
-    this.unsubscribeLane = null;
-    this.neutralHoldStartedAt = null;
-    this.laneDwellStartedAt = null;
-    this.gestureListening = false;
-    this.validateSuccess = false;
-    this.setDetection?.(false);
-
-    const target = VALIDATE_SEQUENCE[this.validateIndex];
-    if (!target) {
-      this.finish(this.buildProfile());
+    if (this.holdAnchor === null || Math.abs(signal - this.holdAnchor) > CALIBRATION.LANE_STEADY) {
+      this.holdAnchor = signal;
+      this.holdStartedAt = now;
+      this.holdSum = signal;
+      this.holdCount = 1;
+      this.emit(this.instruction(now), holdFeedback(0, CALIBRATION.LANE_HOLD_MS));
       return;
     }
 
-    if (target === 'JUMP' || target === 'DUCK') {
-      // Neutral gate: wait until user is actually standing still before enabling detection.
-      this.emitValidateUpdate(
-        target === 'JUMP'
-          ? 'Stand neutrally, then JUMP when ready.'
-          : 'Stand neutrally, then DUCK / crouch when ready.',
-      );
-      return;
-    }
-
-    // Lane targets: enable continuous lane detection immediately and require dwell.
-    this.setDetection?.(true);
-    this.unsubscribeLane = this.bus.on('poseLane', ({ lane }) => {
-      if (!this.active || this.step !== 'validate' || this.validateSuccess) return;
-      this.handleValidateLane(lane);
-    });
-
-    this.emitValidateUpdate(this.validateInstruction(target));
-  }
-
-  private handleValidateSample(sample: PoseSample): void {
-    if (this.validateSuccess) {
-      if (performance.now() >= this.validateSuccessUntil) {
-        this.advanceValidate();
+    this.holdSum += signal;
+    this.holdCount += 1;
+    const span = now - (this.holdStartedAt ?? now);
+    if (span >= CALIBRATION.LANE_HOLD_MS) {
+      const avg = this.holdSum / this.holdCount;
+      if (this.step === 'lane_left') {
+        this.leftX = avg;
+        this.profile.lanes.leftX = avg;
+      } else {
+        this.profile.lanes.rightX = avg;
       }
+      this.complete(holdFeedback(1, 1), now);
       return;
     }
-
-    const target = VALIDATE_SEQUENCE[this.validateIndex];
-    if (!target) return;
-
-    if (target === 'JUMP' || target === 'DUCK') {
-      this.handleValidateGestureGate(sample, target);
-    }
+    this.emit(this.instruction(now), holdFeedback(span, CALIBRATION.LANE_HOLD_MS));
   }
 
-  private handleValidateGestureGate(sample: PoseSample, target: 'JUMP' | 'DUCK'): void {
-    if (this.gestureListening) return;
-
-    const torso = Math.max(0.05, this.baseline.torsoHeight);
-    const shoulderDeltaUp = (this.baseline.shoulderY - sample.shoulderMidY) / torso;
-    const shoulderDeltaDown = (sample.shoulderMidY - this.baseline.shoulderY) / torso;
-    const jumpThresh = this.deriveThreshold(this.peaks.jump, VISION.JUMP_RATIO);
-    const duckThresh = this.deriveThreshold(this.peaks.duck, VISION.DUCK_RATIO);
-
-    const isNeutral =
-      shoulderDeltaUp < jumpThresh * VISION.RELEASE_FACTOR &&
-      shoulderDeltaDown < duckThresh * VISION.RELEASE_FACTOR;
-
-    if (!isNeutral) {
-      this.neutralHoldStartedAt = null;
+  /**
+   * A rep is one time in the air, from the feet cue or the hip cue. Foot lift
+   * sets airLift; hip rise sets hipJump. A hip-only rep still counts.
+   */
+  private handleJump(frame: BodyFrame | null, now: number): void {
+    const target = CALIBRATION.GESTURE_REPS;
+    if (!frame?.valid) {
+      this.emit(FEET_HINT, repFeedback(this.jumpReps.length, target));
       return;
     }
-
-    const now = performance.now();
-    if (this.neutralHoldStartedAt === null) {
-      this.neutralHoldStartedAt = now;
-      return;
-    }
-
-    if (now - this.neutralHoldStartedAt < CALIBRATION.VALIDATE_NEUTRAL_MS) return;
-
-    // Neutral held long enough — arm detection for this one gesture.
-    this.gestureListening = true;
-    this.setDetection?.(true);
-    this.unsubscribeGesture = this.bus.on('gesture', ({ gesture, source }) => {
-      if (!this.active || source !== 'pose' || this.validateSuccess) return;
-      if (gesture === target) {
-        this.markValidateSuccess();
+    const air = frame.airPhase;
+    if (air && (air.peakLift >= CALIBRATION.JUMP_REP_MIN_LIFT || air.peakHip >= BODY.HIP_JUMP_MIN)) {
+      this.jumpReps.push({ foot: air.peakLift, hip: air.peakHip });
+      if (this.jumpReps.length >= target) {
+        const footPeaks = this.jumpReps
+          .map((r) => r.foot)
+          .filter((v) => v >= CALIBRATION.JUMP_REP_MIN_LIFT);
+        const partial: Partial<PoseProfile['thresholds']> = {
+          hipJump: Math.max(
+            BODY.HIP_JUMP_MIN,
+            CALIBRATION.HIP_FROM_REP * Math.min(...this.jumpReps.map((r) => r.hip)),
+          ),
+        };
+        if (footPeaks.length > 0) {
+          partial.airLift = clamp(
+            CALIBRATION.AIR_FROM_REP * Math.min(...footPeaks),
+            this.airLiftFloor(),
+            BODY.AIR_LIFT_MAX,
+          );
+        }
+        this.setThreshold(partial);
+        this.complete(repFeedback(target, target), now);
+        return;
       }
-    });
+    }
+    this.emit(this.instruction(now), repFeedback(this.jumpReps.length, target));
+  }
 
-    this.emitValidateUpdate(
-      target === 'JUMP' ? 'Now JUMP!' : 'Now DUCK / crouch!',
+  /** A rep is a crouch held long enough that a jump wind-up cannot count. */
+  private handleDuck(frame: BodyFrame | null, now: number): void {
+    const target = CALIBRATION.GESTURE_REPS;
+    if (!frame?.valid) {
+      this.emit(FEET_HINT, repFeedback(this.repValues.length, target));
+      return;
+    }
+    const crouch = frame.crouchPhase;
+    if (
+      crouch &&
+      crouch.durationMs >= CALIBRATION.DUCK_HOLD_MS &&
+      crouch.peakDepth >= CALIBRATION.DUCK_REP_MIN_DEPTH
+    ) {
+      this.repValues.push(crouch.peakDepth);
+      if (this.repValues.length >= target) {
+        const depth = clamp(
+          CALIBRATION.CROUCH_FROM_REP * Math.min(...this.repValues),
+          BODY.CROUCH_MIN,
+          BODY.CROUCH_MAX,
+        );
+        this.setThreshold({ crouch: depth });
+        this.complete(repFeedback(target, target), now);
+        return;
+      }
+    }
+    this.emit(this.instruction(now), repFeedback(this.repValues.length, target));
+  }
+
+  private handleRun(sample: PoseSample | null, now: number): void {
+    const legsVisible = !!sample && (sample.ankleMidY !== null || sample.kneeMidY !== null);
+    if (!sample || !legsVisible) {
+      this.resetRunHold();
+      this.emit(FEET_HINT, holdFeedback(0, CALIBRATION.RUN_CAPTURE_MS));
+      return;
+    }
+
+    const level = this.cadence.update(sample, this.profile.baseline.torsoHeight);
+    const idle = Math.max(this.idleLevel, 0.004);
+    const gate = idle * CALIBRATION.RUN_IDLE_FACTOR;
+    if (level > gate) {
+      this.runBelowSince = null;
+      if (this.runHoldStart === null) this.runHoldStart = now;
+      this.runSamples.push(level);
+      const span = now - this.runHoldStart;
+      if (span >= CALIBRATION.RUN_CAPTURE_MS) {
+        const low = percentile(this.runSamples, 0.2);
+        if (low > idle) {
+          this.setThreshold({ runCadence: (idle + low) / 2 });
+          this.complete(holdFeedback(1, 1), now);
+          return;
+        }
+        this.resetRunHold();
+        this.emit(this.instruction(now), holdFeedback(0, CALIBRATION.RUN_CAPTURE_MS));
+        return;
+      }
+      this.emit(this.instruction(now), holdFeedback(span, CALIBRATION.RUN_CAPTURE_MS));
+      return;
+    }
+
+    // A stride pauses between steps. Don't wipe the bar for that gap.
+    if (this.runHoldStart !== null) {
+      if (this.runBelowSince === null) this.runBelowSince = now;
+      const span = now - this.runHoldStart;
+      if (now - this.runBelowSince < CALIBRATION.RUN_GAP_MS) {
+        this.emit(this.instruction(now), holdFeedback(span, CALIBRATION.RUN_CAPTURE_MS));
+        return;
+      }
+    }
+
+    this.resetRunHold();
+    this.emit(this.instruction(now), holdFeedback(0, CALIBRATION.RUN_CAPTURE_MS));
+  }
+
+  /**
+   * A rep is one jump with a star shape that clears the fixed minimums on enough
+   * frames. Thresholds land between the minimums and your weakest rep, so both
+   * reps would clear them in a run.
+   */
+  private handleStarJump(frame: BodyFrame | null, now: number): void {
+    const target = CALIBRATION.GESTURE_REPS;
+    if (!frame?.valid) {
+      this.emit(FEET_HINT, repFeedback(this.starReps.length, target));
+      return;
+    }
+    const air = frame.airPhase;
+    if (air && air.starFrames >= BODY.STAR_JUMP_FRAMES && air.starBest) {
+      const best = air.starBest;
+      this.starReps.push({ arm: Math.min(best.armL, best.armR), spread: best.spread });
+      if (this.starReps.length >= target) {
+        const minArm = Math.min(...this.starReps.map((r) => r.arm));
+        const minSpread = Math.min(...this.starReps.map((r) => r.spread));
+        this.setThreshold({
+          starArm: Math.max(BODY.STAR_ARM_MIN, CALIBRATION.STAR_ARM_FROM_REP * minArm),
+          starSpread: Math.max(this.starSpreadFloor(), CALIBRATION.STAR_SPREAD_FROM_REP * minSpread),
+        });
+        this.complete(repFeedback(target, target), now);
+        return;
+      }
+    }
+    this.emit(this.instruction(now), repFeedback(this.starReps.length, target));
+  }
+
+  private airLiftFloor(): number {
+    return Math.max(
+      BODY.AIR_LIFT_MIN,
+      this.profile.baseline.ankleNoise * CALIBRATION.NOISE_MULTIPLIER,
     );
   }
 
-  private handleValidateLane(lane: Lane): void {
-    const target = VALIDATE_SEQUENCE[this.validateIndex];
-    if (!target || this.validateSuccess) return;
+  private starSpreadFloor(): number {
+    return Math.max(
+      BODY.STAR_SPREAD_MIN,
+      this.profile.baseline.footSpread * CALIBRATION.STAR_SPREAD_OVER_STANDING,
+    );
+  }
 
-    const expected = this.laneForTarget(target);
-    if (expected === null) return;
+  private setThreshold(partial: Partial<PoseProfile['thresholds']>): void {
+    this.profile.thresholds = { ...this.profile.thresholds, ...partial };
+    this.body?.setThresholds(partial);
+  }
 
-    const now = performance.now();
-    if (lane === expected) {
-      if (this.laneDwellStartedAt === null) {
-        this.laneDwellStartedAt = now;
-      } else if (now - this.laneDwellStartedAt >= CALIBRATION.VALIDATE_LANE_DWELL_MS) {
-        this.markValidateSuccess();
-      } else {
-        const dwellProgress =
-          (now - this.laneDwellStartedAt) / CALIBRATION.VALIDATE_LANE_DWELL_MS;
-        this.emitValidateUpdate(this.validateInstruction(target), dwellProgress);
-      }
-    } else {
-      this.laneDwellStartedAt = null;
-      this.emitValidateUpdate(this.validateInstruction(target), 0);
+  private relativeStd(
+    value: (s: StillSample) => number,
+    scale: (s: StillSample) => number,
+  ): number {
+    const n = this.still.length;
+    if (n < 2) return 0;
+    const mean = this.still.reduce((sum, s) => sum + value(s), 0) / n;
+    const variance = this.still.reduce((sum, s) => sum + (value(s) - mean) ** 2, 0) / n;
+    const meanScale = this.still.reduce((sum, s) => sum + scale(s), 0) / n;
+    return Math.sqrt(variance) / Math.max(0.05, meanScale);
+  }
+
+  private instruction(now: number): string {
+    if (now - this.stepStartedAt >= CALIBRATION.HINT_AFTER_MS) return this.hint();
+    return this.prompt();
+  }
+
+  private prompt(): string {
+    switch (this.step) {
+      case 'stand':
+        return 'Stand still in the middle';
+      case 'lane_left':
+        return 'Step to your left';
+      case 'lane_right':
+        return 'Step to your right';
+      case 'jump':
+        return 'Back to the middle, jump twice';
+      case 'duck':
+        return 'Duck down and hold, twice';
+      case 'run':
+        return 'Run in place';
+      case 'star_jump':
+        return 'Star jump twice — arms up and out, feet wide';
+      default:
+        return 'Calibration complete';
     }
   }
 
-  private markValidateSuccess(): void {
-    this.validateSuccess = true;
-    this.validateSuccessUntil = performance.now() + CALIBRATION.VALIDATE_SUCCESS_PAUSE_MS;
-    this.setDetection?.(false);
-    this.unsubscribeGesture?.();
-    this.unsubscribeGesture = null;
-    this.unsubscribeLane?.();
-    this.unsubscribeLane = null;
-    this.emitValidateUpdate('Nice!', 1, true);
+  private hint(): string {
+    switch (this.step) {
+      case 'stand':
+        return 'Hold still';
+      case 'lane_left':
+        return 'Step farther to your left';
+      case 'lane_right':
+        return 'Step farther to your right';
+      case 'jump':
+        return 'Jump higher — both feet off the floor';
+      case 'duck':
+        return 'Crouch lower and hold it';
+      case 'run':
+        return 'Move your feet faster';
+      case 'star_jump':
+        return 'Jump higher, arms above shoulders, feet wider';
+      default:
+        return 'Calibration complete';
+    }
   }
 
-  private advanceValidate(): void {
-    this.validateIndex += 1;
-    if (this.validateIndex >= VALIDATE_SEQUENCE.length) {
+  private resetLaneHold(): void {
+    this.holdStartedAt = null;
+    this.holdAnchor = null;
+    this.holdSum = 0;
+    this.holdCount = 0;
+  }
+
+  private resetRunHold(): void {
+    this.runHoldStart = null;
+    this.runBelowSince = null;
+    this.runSamples = [];
+  }
+
+  private resetStepState(): void {
+    this.still = [];
+    this.stillSince = null;
+    this.resetLaneHold();
+    this.repValues = [];
+    this.jumpReps = [];
+    this.starReps = [];
+    this.resetRunHold();
+  }
+
+  /** `now` is on the poseFrame timeline, which the hint timer compares against. */
+  private enter(step: CalibrationStepId, now = performance.now()): void {
+    this.step = step;
+    this.stepStartedAt = now;
+    this.resetStepState();
+    if (step === 'stand' || step === 'run') this.cadence.reset();
+    const feedback =
+      step === 'jump' || step === 'duck' || step === 'star_jump'
+        ? repFeedback(0, CALIBRATION.GESTURE_REPS)
+        : holdFeedback(0, 1);
+    this.emit(this.prompt(), feedback);
+  }
+
+  /** Show the finished step (full bar or all dots) briefly, then move on. */
+  private complete(feedback: CalibrationFeedback, now: number): void {
+    this.completeUntil = now + CALIBRATION.SUCCESS_BEAT_MS;
+    this.completeFeedback = feedback;
+    this.emit('Nice!', feedback);
+  }
+
+  private advance(now: number): void {
+    const index = STEPS.indexOf(this.step);
+    const next = STEPS[index + 1];
+    if (!next) {
       this.finish(this.buildProfile());
       return;
     }
-    this.startValidateTarget();
-  }
-
-  private emitValidateUpdate(instruction: string, progress = 0, success = false): void {
-    const target = VALIDATE_SEQUENCE[this.validateIndex];
-    this.emitUpdate({
-      phase: 'validate',
-      step: 'validate',
-      instruction,
-      progress,
-      validateTarget: target,
-      validateIndex: this.validateIndex,
-      validateTotal: VALIDATE_SEQUENCE.length,
-      validateSuccess: success,
-      highlightLane: target ? this.laneForTarget(target) : null,
-    });
-  }
-
-  private validateInstruction(target: ValidateTarget): string {
-    switch (target) {
-      case 'LANE_LEFT':
-        return 'Move into the LEFT lane and hold.';
-      case 'LANE_CENTER':
-        return 'Move into the CENTER lane and hold.';
-      case 'LANE_RIGHT':
-        return 'Move into the RIGHT lane and hold.';
-      case 'JUMP':
-        return 'Stand neutrally, then JUMP when ready.';
-      case 'DUCK':
-        return 'Stand neutrally, then DUCK / crouch when ready.';
-    }
-  }
-
-  private laneForTarget(target: ValidateTarget): Lane | null {
-    switch (target) {
-      case 'LANE_LEFT':
-        return -1;
-      case 'LANE_CENTER':
-        return 0;
-      case 'LANE_RIGHT':
-        return 1;
-      default:
-        return null;
-    }
+    this.enter(next, now);
   }
 
   private buildProfile(): PoseProfile {
-    const leftX = this.lanes.leftX ?? 5 / 6;
-    const centerX = this.lanes.centerX ?? 0.5;
-    const rightX = this.lanes.rightX ?? 1 / 6;
-
     return {
+      ...this.profile,
       version: CALIBRATION.PROFILE_VERSION,
-      baseline: { ...this.baseline },
+      baseline: { ...this.profile.baseline },
       thresholds: {
-        jump: this.deriveThreshold(this.peaks.jump, VISION.JUMP_RATIO),
-        duck: this.deriveThreshold(this.peaks.duck, VISION.DUCK_RATIO),
+        ...this.profile.thresholds,
+        runCadence: this.profile.thresholds.runCadence || VISION.RUN_CADENCE_RATIO,
       },
-      lanes: { leftX, centerX, rightX },
+      lanes: { ...this.profile.lanes },
       createdAt: Date.now(),
     };
   }
 
-  /** In-progress profile so validation uses freshly captured lanes/thresholds. */
-  draftProfile(): PoseProfile {
-    return this.buildProfile();
-  }
-
-  private deriveThreshold(peakDelta: number, defaultRatio: number): number {
-    const noiseFloor = Math.max(
-      this.baseline.noiseStdDev * CALIBRATION.NOISE_MULTIPLIER,
-      defaultRatio * CALIBRATION.THRESHOLD_FLOOR_FACTOR,
-    );
-    const ceiling = defaultRatio * CALIBRATION.THRESHOLD_CEILING_FACTOR;
-    const raw = peakDelta * CALIBRATION.TRIGGER_FRACTION;
-    return Math.min(ceiling, Math.max(noiseFloor, raw));
-  }
-
-  private measureDeviation(sample: PoseSample, kind: 'jump' | 'duck'): number {
-    const torso = Math.max(0.05, this.baseline.torsoHeight);
-    if (kind === 'jump') {
-      return (this.baseline.shoulderY - sample.shoulderMidY) / torso;
-    }
-    return (sample.shoulderMidY - this.baseline.shoulderY) / torso;
-  }
-
-  private instructionFor(kind: CaptureKind): string {
-    switch (kind) {
-      case 'lane_left':
-        return 'Jump / step into the LEFT lane';
-      case 'lane_center':
-        return 'Jump / step back to the CENTER lane';
-      case 'lane_right':
-        return 'Jump / step into the RIGHT lane';
-      case 'jump':
-        return 'Get ready to JUMP';
-      case 'duck':
-        return 'Get ready to DUCK / crouch';
-    }
-  }
-
-  private highlightFor(kind: CaptureKind): Lane | null {
-    switch (kind) {
-      case 'lane_left':
-        return -1;
-      case 'lane_center':
-        return 0;
-      case 'lane_right':
-        return 1;
-      default:
-        return null;
-    }
-  }
-
-  private isLaneCapture(kind: CaptureKind): kind is 'lane_left' | 'lane_center' | 'lane_right' {
-    return kind === 'lane_left' || kind === 'lane_center' || kind === 'lane_right';
-  }
-
-  private isCaptureStep(step: CalibrationStepId): step is CaptureKind {
-    return (
-      step === 'lane_left' ||
-      step === 'lane_center' ||
-      step === 'lane_right' ||
-      step === 'jump' ||
-      step === 'duck'
-    );
-  }
-
-  private buildLaneGuides(): LaneGuides {
-    return {
-      leftX: this.lanes.leftX ?? 5 / 6,
-      centerX: this.lanes.centerX ?? 0.5,
-      rightX: this.lanes.rightX ?? 1 / 6,
+  private emit(instruction: string, feedback: CalibrationFeedback): void {
+    const stepIndex = this.step === 'done' ? STEPS.length : Math.max(0, STEPS.indexOf(this.step));
+    const update: CalibrationUpdate = {
+      step: this.step,
+      stepIndex,
+      stepTotal: STEPS.length,
+      instruction,
+      feedback,
     };
-  }
-
-  private stdDev(values: number[]): number {
-    if (values.length < 2) return 0.01;
-    const mean = values.reduce((a, b) => a + b, 0) / values.length;
-    const variance = values.reduce((sum, v) => sum + (v - mean) ** 2, 0) / values.length;
-    return Math.sqrt(variance);
-  }
-
-  private emitUpdate(update: Omit<CalibrationUpdate, 'laneGuides'> & { laneGuides?: LaneGuides }): void {
-    this.bus.emit('calibration', {
-      ...update,
-      laneGuides: update.laneGuides ?? this.buildLaneGuides(),
-    });
+    this.bus.emit('calibration', update);
   }
 
   private finish(profile: PoseProfile | null): void {
     const cb = this.onComplete;
-    this.setDetection?.(false);
     this.stopInternal(true);
     if (profile) {
-      this.emitUpdate({
-        phase: 'done',
-        step: 'done',
-        instruction: 'Calibration complete!',
-        progress: 1,
-      });
+      this.step = 'done';
+      this.emit('Calibration complete', holdFeedback(1, 1));
     }
     cb?.(profile);
   }
 
   private stopInternal(clearCallbacks: boolean): void {
     this.active = false;
+    this.completeUntil = null;
+    this.completeFeedback = null;
     this.unsubscribeFrame?.();
     this.unsubscribeFrame = null;
-    this.unsubscribeGesture?.();
-    this.unsubscribeGesture = null;
-    this.unsubscribeLane?.();
-    this.unsubscribeLane = null;
-    if (clearCallbacks) {
-      this.onComplete = null;
-      this.setDetection = null;
-    }
+    if (clearCallbacks) this.onComplete = null;
   }
+}
+
+function holdFeedback(value: number, target: number): CalibrationFeedback {
+  return { kind: 'hold', value: Math.max(0, value), target };
+}
+
+function repFeedback(value: number, target: number): CalibrationFeedback {
+  return { kind: 'reps', value, target };
+}
+
+function clamp(v: number, lo: number, hi: number): number {
+  return Math.min(hi, Math.max(lo, v));
+}
+
+function percentile(values: number[], p: number): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const index = Math.min(sorted.length - 1, Math.max(0, Math.floor(p * (sorted.length - 1))));
+  return sorted[index]!;
 }

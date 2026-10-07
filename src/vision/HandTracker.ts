@@ -1,59 +1,61 @@
-import { FilesetResolver, HandLandmarker } from '@mediapipe/tasks-vision';
-import { HAND_LANDMARK, HAND_UI, VISION } from '../config/GameConfig';
+import { HAND_LANDMARK, HAND_UI, LANDMARK, VISION } from '../config/GameConfig';
 import type { EventBus } from '../core/EventBus';
 import type { GameEvents, Handedness, PoseLandmarkPoint, Vec2 } from '../core/types';
-import {
-  parseHandedness,
-  pointToUv,
-  toDisplayPoint,
-  uvToScreen,
-  type HandProfile,
-} from './HandProfile';
+import { uvToScreen, type HandProfile } from './HandProfile';
+import { OneEuroFilter } from './OneEuroFilter';
 
+const ARM: Record<Handedness, { shoulder: number; elbow: number; wrist: number }> = {
+  Left: { shoulder: LANDMARK.L_SHOULDER, elbow: LANDMARK.L_ELBOW, wrist: LANDMARK.L_WRIST },
+  Right: { shoulder: LANDMARK.R_SHOULDER, elbow: LANDMARK.R_ELBOW, wrist: LANDMARK.R_WRIST },
+};
+
+type Px = { x: number; y: number };
+
+/**
+ * Menu cursor and pinch, driven by pose frames.
+ *
+ * The cursor is the body tracker's wrist inside a pointing area anchored to the
+ * active shoulder, so it works at full-body distance where the hand model alone
+ * cannot find a hand. Pinch reads the hand landmarks that pose inference
+ * returns from a wrist crop of that same frame.
+ */
 export class HandTracker {
-  private readonly video: HTMLVideoElement;
   private readonly bus: EventBus<GameEvents>;
-  private landmarker: HandLandmarker | null = null;
-  private running = false;
+  private unsubscribe: (() => void) | null = null;
   private enabled = false;
   private profile: HandProfile | null = null;
-  private rafHandle = 0;
-  private rvfcHandle = 0;
-  private lastTimestampMs = -1;
 
   private pinching = false;
   private pinchStartedAt = 0;
   private pinchHeld = false;
   private pinchCommitLatched = false;
 
-  /** Locked during calibration before a profile exists; overridden by profile.handedness. */
+  /** Locked during setup before a profile exists; overridden by profile.handedness. */
   private sessionHandedness: Handedness | null = null;
-  /** Provisional thresholds after pinch calib, before full profile is saved. */
   private sessionPinchClose: number | null = null;
   private sessionPinchOpen: number | null = null;
-  private smoothedCursor: Vec2 | null = null;
 
-  private readonly onFrame: (now: number) => void;
+  private readonly fx = new OneEuroFilter(
+    HAND_UI.CURSOR_MIN_CUTOFF,
+    HAND_UI.CURSOR_BETA,
+    HAND_UI.CURSOR_D_CUTOFF,
+  );
+  private readonly fy = new OneEuroFilter(
+    HAND_UI.CURSOR_MIN_CUTOFF,
+    HAND_UI.CURSOR_BETA,
+    HAND_UI.CURSOR_D_CUTOFF,
+  );
 
-  constructor(video: HTMLVideoElement, bus: EventBus<GameEvents>) {
-    this.video = video;
+  constructor(bus: EventBus<GameEvents>) {
     this.bus = bus;
-    this.onFrame = (now) => this.processFrame(now);
   }
 
   setProfile(profile: HandProfile | null): void {
     this.profile = profile;
-    if (profile) {
-      this.sessionHandedness = profile.handedness;
-      this.sessionPinchClose = profile.pinchClose;
-      this.sessionPinchOpen = profile.pinchOpen;
-    } else {
-      // Full reset — recalibration must not keep the previous hand/pinch lock.
-      this.sessionHandedness = null;
-      this.sessionPinchClose = null;
-      this.sessionPinchOpen = null;
-    }
-    this.smoothedCursor = null;
+    this.sessionHandedness = profile?.handedness ?? null;
+    this.sessionPinchClose = profile?.pinchClose ?? null;
+    this.sessionPinchOpen = profile?.pinchOpen ?? null;
+    this.resetCursor();
     this.resetPinch();
   }
 
@@ -61,29 +63,25 @@ export class HandTracker {
     return this.profile;
   }
 
-  /** Apply pinch thresholds mid-calibration (after open/close cycles). */
+  /** Apply pinch thresholds mid-setup, before the profile is saved. */
   setPinchThresholds(close: number, open: number): void {
     this.sessionPinchClose = close;
     this.sessionPinchOpen = open;
     this.resetPinch();
   }
 
-  /** Lock which hand to track after framing majority-vote (calibration only). */
   lockSessionHandedness(handedness: Handedness): void {
     this.sessionHandedness = handedness;
+    this.resetCursor();
   }
 
-  /** Clear session lock when starting a fresh Hand UI calibration. */
+  /** Fresh setup: drop the previous hand and pinch thresholds. */
   clearSessionHandedness(): void {
     this.sessionHandedness = null;
     this.sessionPinchClose = null;
     this.sessionPinchOpen = null;
-    this.smoothedCursor = null;
+    this.resetCursor();
     this.resetPinch();
-  }
-
-  getSessionHandedness(): Handedness | null {
-    return this.profile?.handedness ?? this.sessionHandedness;
   }
 
   /** When false, skip detection and emit nothing (required during RUNNING). */
@@ -91,7 +89,7 @@ export class HandTracker {
     this.enabled = enabled;
     if (!enabled) {
       this.resetPinch();
-      this.smoothedCursor = null;
+      this.resetCursor();
     }
   }
 
@@ -99,51 +97,116 @@ export class HandTracker {
     return this.enabled;
   }
 
-  /** Assumes `#webcam` already has an active MediaStream. */
+  /**
+   * The side pose inference should crop, or null when hand controls are off
+   * or the menu hand is not chosen yet. Pose never runs the hand model for a
+   * null request.
+   */
+  requestedHand(): Handedness | null {
+    if (!this.enabled) return null;
+    return this.activeSide();
+  }
+
+  /** Needs a running PoseTracker: it listens to poseFrame. The hand model lives there. */
   async start(): Promise<void> {
-    if (this.running) return;
-
-    if (!this.video.srcObject) {
-      throw new Error('HandTracker.start() requires an active camera on the video element');
-    }
-
-    const fileset = await FilesetResolver.forVisionTasks(VISION.WASM_BASE);
-    this.landmarker = await HandLandmarker.createFromOptions(fileset, {
-      baseOptions: {
-        modelAssetPath: VISION.HAND_MODEL_URL,
-        delegate: 'GPU',
-      },
-      runningMode: 'VIDEO',
-      numHands: 2,
-    });
-
-    this.running = true;
-    this.scheduleNextFrame();
+    if (this.unsubscribe) return;
+    this.unsubscribe = this.bus.on('poseFrame', (frame) => this.onPoseFrame(frame.landmarks, frame.hand, frame.t));
   }
 
   stop(): void {
-    this.running = false;
     this.enabled = false;
+    this.unsubscribe?.();
+    this.unsubscribe = null;
     this.resetPinch();
-    this.smoothedCursor = null;
-    if (this.rvfcHandle && this.video.cancelVideoFrameCallback) {
-      this.video.cancelVideoFrameCallback(this.rvfcHandle);
-      this.rvfcHandle = 0;
+    this.resetCursor();
+  }
+
+  private onPoseFrame(pose: PoseLandmarkPoint[], hand: PoseLandmarkPoint[] | null, t: number): void {
+    if (!this.enabled) return;
+    if (pose.length === 0) {
+      this.emitEmpty();
+      return;
     }
-    if (this.rafHandle) {
-      cancelAnimationFrame(this.rafHandle);
-      this.rafHandle = 0;
+
+    const px = (i: number): Px | null => {
+      const p = pose[i];
+      if (!p || (p.visibility ?? 0) < VISION.MIN_VISIBILITY) return null;
+      return { x: p.x, y: p.y };
+    };
+
+    const raised: Record<Handedness, boolean> = { Left: false, Right: false };
+    for (const side of ['Left', 'Right'] as const) {
+      const e = px(ARM[side].elbow);
+      const w = px(ARM[side].wrist);
+      raised[side] = !!e && !!w && w.y < e.y;
     }
-    this.landmarker?.close();
-    this.landmarker = null;
+
+    const lShoulder = px(LANDMARK.L_SHOULDER);
+    const rShoulder = px(LANDMARK.R_SHOULDER);
+    const side = this.activeSide() ?? this.pickRaised(raised, px);
+    const shoulder = side ? px(ARM[side].shoulder) : null;
+    const wrist = side ? px(ARM[side].wrist) : null;
+    if (!side || !lShoulder || !rShoulder || !shoulder || !wrist) {
+      this.resetPinch();
+      this.resetCursor();
+      this.emitFrame(null, side, raised, null, false, 0);
+      return;
+    }
+
+    const sw = Math.max(0.02, Math.hypot(lShoulder.x - rShoulder.x, lShoulder.y - rShoulder.y));
+    const rx = (wrist.x - shoulder.x) / sw;
+    const ry = (wrist.y - shoulder.y) / sw;
+    const inZoneY = ry > -HAND_UI.ZONE_TOP - 0.3 && ry < HAND_UI.ZONE_HEIGHT - HAND_UI.ZONE_TOP;
+    if (!inZoneY) {
+      this.resetPinch();
+      this.resetCursor();
+      this.emitFrame(null, side, raised, null, false, 0);
+      return;
+    }
+
+    const uImage = 0.5 + rx / HAND_UI.ZONE_WIDTH;
+    const v = (ry + HAND_UI.ZONE_TOP) / HAND_UI.ZONE_HEIGHT;
+    const u = HAND_UI.MIRROR_X ? 1 - uImage : uImage;
+    const cursor: Vec2 = {
+      x: clamp01(this.fx.filter(clamp01(u), t)),
+      y: clamp01(this.fy.filter(clamp01(v), t)),
+    };
+
+    const pinchRatio = pinchRatioFrom(hand);
+    let pinchCommit = false;
+    let pinchProgress = 0;
+    if (pinchRatio === null) {
+      this.resetPinch();
+    } else {
+      ({ pinchCommit, pinchProgress } = this.updatePinch(pinchRatio, t));
+    }
+    this.emitFrame(cursor, side, raised, pinchRatio, pinchCommit, pinchProgress);
+  }
+
+  private activeSide(): Handedness | null {
+    return this.profile?.handedness ?? this.sessionHandedness;
+  }
+
+  /** Before a hand is locked: the one raised hand, or the higher of two. */
+  private pickRaised(
+    raised: Record<Handedness, boolean>,
+    px: (i: number) => Px | null,
+  ): Handedness | null {
+    if (raised.Left && !raised.Right) return 'Left';
+    if (raised.Right && !raised.Left) return 'Right';
+    if (!raised.Left && !raised.Right) return null;
+    const l = px(ARM.Left.wrist);
+    const r = px(ARM.Right.wrist);
+    if (!l || !r) return null;
+    return l.y < r.y ? 'Left' : 'Right';
   }
 
   private pinchClose(): number {
-    return this.profile?.pinchClose ?? this.sessionPinchClose ?? HAND_UI.PINCH_RATIO_CLOSE;
+    return this.sessionPinchClose ?? HAND_UI.PINCH_RATIO_CLOSE;
   }
 
   private pinchOpen(): number {
-    return this.profile?.pinchOpen ?? this.sessionPinchOpen ?? HAND_UI.PINCH_RATIO_OPEN;
+    return this.sessionPinchOpen ?? HAND_UI.PINCH_RATIO_OPEN;
   }
 
   private resetPinch(): void {
@@ -153,168 +216,31 @@ export class HandTracker {
     this.pinchCommitLatched = false;
   }
 
-  private scheduleNextFrame(): void {
-    if (!this.running) return;
-    if (typeof this.video.requestVideoFrameCallback === 'function') {
-      this.rvfcHandle = this.video.requestVideoFrameCallback((now) => this.onFrame(now));
-      return;
-    }
-    this.rafHandle = requestAnimationFrame((now) => this.onFrame(now));
-  }
-
-  private processFrame(now: number): void {
-    if (!this.running || !this.landmarker) return;
-
-    const timestampMs = Math.max(now, this.lastTimestampMs + 1);
-    if (timestampMs <= this.lastTimestampMs) {
-      this.scheduleNextFrame();
-      return;
-    }
-    this.lastTimestampMs = timestampMs;
-
-    if (!this.enabled) {
-      this.scheduleNextFrame();
-      return;
-    }
-
-    try {
-      const result = this.landmarker.detectForVideo(this.video, timestampMs);
-      const selected = this.selectHand(result);
-      if (!selected) {
-        this.resetPinch();
-        this.smoothedCursor = null;
-        this.emitEmpty();
-        this.scheduleNextFrame();
-        return;
-      }
-
-      const { hand, handedness } = selected;
-      // Do not auto-lock from the first frame — HandCalibrator locks after framing
-      // majority-vote so recalibration can switch hands cleanly.
-
-      const wristRaw = hand[HAND_LANDMARK.WRIST];
-      const tipRaw = hand[HAND_LANDMARK.INDEX_TIP];
-      const thumbRaw = hand[HAND_LANDMARK.THUMB_TIP];
-      const mcpRaw = hand[HAND_LANDMARK.MIDDLE_MCP];
-      if (!wristRaw || !tipRaw || !thumbRaw || !mcpRaw) {
-        this.resetPinch();
-        this.smoothedCursor = null;
-        this.emitEmpty();
-        this.scheduleNextFrame();
-        return;
-      }
-
-      const wrist = toDisplayPoint({ x: wristRaw.x, y: wristRaw.y });
-      const indexTip = toDisplayPoint({ x: tipRaw.x, y: tipRaw.y });
-      const thumb = toDisplayPoint({ x: thumbRaw.x, y: thumbRaw.y });
-      const mcp = toDisplayPoint({ x: mcpRaw.x, y: mcpRaw.y });
-
-      const pinchDistance = Math.hypot(indexTip.x - thumb.x, indexTip.y - thumb.y);
-      const handScale = Math.max(
-        HAND_UI.HAND_SCALE_MIN,
-        Math.hypot(mcp.x - wrist.x, mcp.y - wrist.y),
-      );
-      const pinchRatio = pinchDistance / handScale;
-
-      const cursor = this.smoothCursor(wrist);
-      const { pinchCommit, pinchProgress } = this.updatePinch(pinchRatio, timestampMs);
-
-      this.bus.emit('handFrame', {
-        landmarks: hand,
-        cursor,
-        handedness,
-        pinchDistance,
-        pinchRatio,
-        pinching: this.pinching,
-        pinchHeld: this.pinchHeld,
-        pinchCommit,
-        pinchProgress,
-      });
-
-      this.emitPointer(cursor, pinchCommit, pinchProgress);
-    } catch (error) {
-      console.warn('[hands] detectForVideo failed:', error);
-    }
-
-    this.scheduleNextFrame();
-  }
-
-  private selectHand(result: {
-    landmarks: Array<PoseLandmarkPoint[]>;
-    handedness?: Array<Array<{ categoryName?: string; score?: number }>>;
-  }): { hand: PoseLandmarkPoint[]; handedness: Handedness } | null {
-    const preferred = this.profile?.handedness ?? this.sessionHandedness;
-    const count = result.landmarks.length;
-
-    for (let i = 0; i < count; i++) {
-      const hand = result.landmarks[i] as PoseLandmarkPoint[] | undefined;
-      if (!hand) continue;
-      const label = parseHandedness(result.handedness?.[i]?.[0]?.categoryName);
-      if (!label) continue;
-      if (preferred && label !== preferred) continue;
-      return { hand, handedness: label };
-    }
-
-    if (!preferred) {
-      for (let i = 0; i < count; i++) {
-        const hand = result.landmarks[i] as PoseLandmarkPoint[] | undefined;
-        if (!hand) continue;
-        const label = parseHandedness(result.handedness?.[i]?.[0]?.categoryName);
-        if (!label) continue;
-        return { hand, handedness: label };
-      }
-    }
-
-    return null;
-  }
-
-  private smoothCursor(raw: Vec2): Vec2 {
-    if (!this.smoothedCursor) {
-      this.smoothedCursor = { ...raw };
-      return this.smoothedCursor;
-    }
-
-    const delta = Math.hypot(raw.x - this.smoothedCursor.x, raw.y - this.smoothedCursor.y);
-    const span = Math.max(1e-6, HAND_UI.CURSOR_SPEED_HI - HAND_UI.CURSOR_SPEED_LO);
-    const t = Math.max(0, Math.min(1, (delta - HAND_UI.CURSOR_SPEED_LO) / span));
-    const alpha =
-      HAND_UI.CURSOR_ALPHA_SLOW +
-      t * (HAND_UI.CURSOR_ALPHA_FAST - HAND_UI.CURSOR_ALPHA_SLOW);
-
-    this.smoothedCursor = {
-      x: alpha * raw.x + (1 - alpha) * this.smoothedCursor.x,
-      y: alpha * raw.y + (1 - alpha) * this.smoothedCursor.y,
-    };
-    return this.smoothedCursor;
+  private resetCursor(): void {
+    this.fx.reset();
+    this.fy.reset();
   }
 
   private updatePinch(
     pinchRatio: number,
     now: number,
   ): { pinchCommit: boolean; pinchProgress: number } {
-    const close = this.pinchClose();
-    const open = this.pinchOpen();
-
     if (!this.pinching) {
-      if (pinchRatio <= close) {
+      if (pinchRatio <= this.pinchClose()) {
         this.pinching = true;
         this.pinchStartedAt = now;
         this.pinchHeld = false;
         this.pinchCommitLatched = false;
       }
-    } else if (pinchRatio >= open) {
+    } else if (pinchRatio >= this.pinchOpen()) {
       this.resetPinch();
       return { pinchCommit: false, pinchProgress: 0 };
     }
 
-    if (!this.pinching) {
-      return { pinchCommit: false, pinchProgress: 0 };
-    }
+    if (!this.pinching) return { pinchCommit: false, pinchProgress: 0 };
 
-    const heldFor = now - this.pinchStartedAt;
-    const pinchProgress = Math.min(1, heldFor / HAND_UI.PINCH_HOLD_MS);
+    const pinchProgress = Math.min(1, (now - this.pinchStartedAt) / HAND_UI.PINCH_HOLD_MS);
     let pinchCommit = false;
-
     if (pinchProgress >= 1) {
       if (!this.pinchCommitLatched) {
         this.pinchCommitLatched = true;
@@ -322,64 +248,58 @@ export class HandTracker {
       }
       this.pinchHeld = true;
     }
-
     return { pinchCommit, pinchProgress };
   }
 
-  private emitPointer(cursor: Vec2, pinchCommit: boolean, pinchProgress: number): void {
-    if (!this.profile) {
-      const screen = uvToScreen(cursor);
-      this.bus.emit('handPointer', {
-        x: screen.x,
-        y: screen.y,
-        u: cursor.x,
-        v: cursor.y,
-        pinching: this.pinching,
-        pinchHeld: this.pinchHeld,
-        pinchCommit,
-        pinchProgress,
-        visible: true,
-      });
-      return;
-    }
-
-    const uv = pointToUv(cursor, this.profile.corners);
-    const screen = uvToScreen(uv);
-    this.bus.emit('handPointer', {
-      x: screen.x,
-      y: screen.y,
-      u: uv.x,
-      v: uv.y,
+  private emitFrame(
+    cursor: Vec2 | null,
+    side: Handedness | null,
+    raised: Record<Handedness, boolean>,
+    pinchRatio: number | null,
+    pinchCommit: boolean,
+    pinchProgress: number,
+  ): void {
+    this.bus.emit('handFrame', {
+      cursor,
+      side,
+      raised,
+      pinchRatio,
       pinching: this.pinching,
       pinchHeld: this.pinchHeld,
       pinchCommit,
       pinchProgress,
-      visible: true,
+    });
+    const screen = cursor ? uvToScreen(cursor) : { x: 0, y: 0 };
+    this.bus.emit('handPointer', {
+      x: screen.x,
+      y: screen.y,
+      u: cursor?.x ?? 0,
+      v: cursor?.y ?? 0,
+      pinching: this.pinching,
+      pinchHeld: this.pinchHeld,
+      pinchCommit,
+      pinchProgress,
+      visible: cursor !== null,
     });
   }
 
   private emitEmpty(): void {
-    this.bus.emit('handFrame', {
-      landmarks: [],
-      cursor: null,
-      handedness: null,
-      pinchDistance: null,
-      pinchRatio: null,
-      pinching: false,
-      pinchHeld: false,
-      pinchCommit: false,
-      pinchProgress: 0,
-    });
-    this.bus.emit('handPointer', {
-      x: 0,
-      y: 0,
-      u: 0,
-      v: 0,
-      pinching: false,
-      pinchHeld: false,
-      pinchCommit: false,
-      pinchProgress: 0,
-      visible: false,
-    });
+    this.resetPinch();
+    this.emitFrame(null, null, { Left: false, Right: false }, null, false, 0);
   }
+}
+
+function pinchRatioFrom(hand: PoseLandmarkPoint[] | null): number | null {
+  if (!hand) return null;
+  const wristH = hand[HAND_LANDMARK.WRIST];
+  const tip = hand[HAND_LANDMARK.INDEX_TIP];
+  const thumb = hand[HAND_LANDMARK.THUMB_TIP];
+  const mcp = hand[HAND_LANDMARK.MIDDLE_MCP];
+  if (!wristH || !tip || !thumb || !mcp) return null;
+  const scale = Math.max(HAND_UI.HAND_SCALE_MIN, Math.hypot(mcp.x - wristH.x, mcp.y - wristH.y));
+  return Math.hypot(tip.x - thumb.x, tip.y - thumb.y) / scale;
+}
+
+function clamp01(v: number): number {
+  return Math.max(0, Math.min(1, v));
 }

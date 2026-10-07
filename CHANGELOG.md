@@ -8,21 +8,53 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- **Hand UI Controls** — MediaPipe Hands cursor for menu screens with pinch-to-click on start, game-over, and calibration buttons.
-- **Hand UI Setup** — separate calibration: pinch/open cycles, 4-corner interaction area, handedness lock (`HandProfile` v3 in localStorage).
+- **Body-state motion controls** — jump means both feet leave the floor (plus an early trigger on the push after a wind-up dip); duck is a held crouch with feet planted. A jump wind-up, a landing dip, and running in place no longer read as ducks or jumps.
+- **Obstacle timing windows** — in motion mode a hit is held open briefly and forgiven if the needed jump, duck, or star jump lands in its window.
+- **Debug overlay** (`?debug`, backtick, or the start-screen Debug button) — fps, pose and hand inference time, capture-to-event delay, live detector traces. Record / Save, Replay, Clear, and Close are buttons (mouse or pinch). R, L, and C still work. Replay reports whether each jump came from the feet, the hips, or both.
+- **Pose inference worker** — MediaPipe runs in a module worker, with a main-thread fallback (`?mainthread`). `?model=full` switches to the full pose model.
+- **Run-in-place stamina (motion)** — knee/ankle cadence tracking; idle bar drains when standing still; after 3s a guard catches you (game over). Jumps, ducks, and star jumps count as activity.
+- **Star gates** — clear them with a star jump: arms up and out, feet wide, while airborne. Shape is measured as joint angles from world landmarks.
+- **Pose calibration** — stand, step left, step right, jump, duck, run in place, star jump. Each step ends when the measurement is captured, using the same detectors as gameplay.
+- **Keyboard star jump** — `J`. Keyboard mode auto-runs (no stamina bar).
+- **Coin collection** — gold coins spawn in open lanes; each coin is worth 10 points (score is coin-based only).
+- **High score** — persisted in localStorage (`subway-surfers-high-score-v1`); shown on start screen and game-over card (with “New High Score!”).
+- **Subway-style visuals** — rails/ties, asphalt lanes, scrolling buildings, cartoony runner character, train barriers (jump) and overhead signs (duck), spinning coins.
+- **Progressive obstacle patterns** — single, double-lane, jump→duck combos, wall-gap, mixed gates, pose gates; gaps shrink and denser patterns ramp with run distance.
+- **Cartoon SFX** — procedural Web Audio whoops/chimes for jump, duck, lane change, coin collect, and death.
+- **Hand UI Controls** — menu cursor with pinch-to-click on start, game-over, and calibration buttons. The cursor follows the body tracker's wrist inside a pointing area anchored to your shoulder (sized in shoulder widths), so it works from full-body distance. Pinch runs the hand model on a crop around that wrist.
+- **Hand UI Setup** — raise the menu hand (hold bar), then pinch twice (rep dots). Thresholds come from those pinches. A weak pinch/open difference sends you back to pinch with a hint (`HandProfile` v5).
 - **Shared webcam stream** — `GameEngine.ensureCameraStarted()` owns the camera; pose and hand trackers share `#webcam`.
 
 ### Changed
 
-- **Start screen** — Hand UI Setup / Enable Hand Controls / Recalibrate Hand UI button.
-- **Hand cursor** — tracks wrist; pinch uses thumb + index; scale-normalized `pinchRatio` thresholds from calibration.
+- **Portrait play** — the game fills a landscape screen rotated 90°. Stand the laptop with the screen on your left and the keyboard on your right. Webcam frames are rotated to match, so pose and hand tracking stay upright.
+- **Pose calibration** — seven prompts that advance when the measurement is captured (stand, left, right, jump ×2, duck ×2, run, star jump ×2). Each finished step shows its full bar or both dots briefly before moving on.
+- **Pose profile** — version bumped to 7. Jumping uses a fused airborne check: both feet above the floor, or the hips rising after an upward push. Blurred ankles no longer discard the frame. Older profiles are ignored; recalibrate motion controls. Hand UI profiles stay version 5.
+- **Cursor** — 1€ filter minimum cutoff 2.5 Hz and a faster speed estimate, so short hand moves stop trailing.
+- **Hand model** — runs in the pose worker (or the main-thread fallback) on the same camera frame as pose. The cursor state machine no longer runs its own model.
+- **Lane response** — 1€-filtered lane signal and a faster lane-change gain.
+- **Camera** — requests 60 fps when the webcam supports it.
+
+### Removed
+
+- **Side-run pose** — gates, keyboard `K`, and calibration step. It looked like a paused running frame from the front camera.
+- **Ground star pose** — the avatar no longer copies a star pose held on the ground, and it does not clear gates.
+- **Scoring** — distance-based score removed; HUD score is coins × points.
+- **Obstacle generation** — pattern waves instead of one random block; larger pool (`POOL_SIZE: 36`).
+- **World look** — brighter daytime palette vs dark block prototypes.
+- **Start screen** — Hand UI Setup / Enable Hand Controls / Recalibrate Hand UI button; high score line.
+- **Hand cursor** — 1€-filtered wrist from the body tracker; pinch uses thumb + index on the wrist crop, with thresholds from setup.
 - **Adaptive cursor smoothing** — velocity-based EMA damps jitter without lag on large moves.
 - **Shorter runway** — obstacles spawn sooner (`SPAWN_Z: -70`, `FIRST_GAP: 8`).
-- **Calibration UI** — larger stage instructions; 1.5s pinch/open dwell during hand setup.
+- **Calibration UI** — pose calibration and hand setup share one screen: step counter, instruction, hold bar or rep dots, Cancel.
 
 ### Fixed
 
 - **Recalibrate Hand UI** — clears previous handedness/pinch profile so a different hand can be calibrated fresh.
+- **Duck length** — pose duck lasts as long as you crouch instead of a fixed 600 ms.
+- **Calibration rep dots** — the second dot fills before the step advances.
+- **Missed jumps** — a jump still counts when the ankles blur, as long as the hips rise or another foot point (heel or toe) clears the floor. Both feet confidently on the floor still veto a tiptoe or a sway.
+- **Cursor lag** — pinch detection no longer runs on the main thread inside the pose result, so pose frames are not stuck behind the hand model.
 
 ## [0.2.0] - 2026-08-06
 

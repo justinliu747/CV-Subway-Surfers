@@ -2,6 +2,7 @@ export class StartScreen {
   private readonly root: HTMLElement;
   private readonly overlay: HTMLElement;
   private readonly metaEl: HTMLElement;
+  private readonly highScoreEl: HTMLElement;
   private readonly motionBtn: HTMLButtonElement;
   private readonly calibrateBtn: HTMLButtonElement;
   private readonly handUiBtn: HTMLButtonElement;
@@ -10,6 +11,7 @@ export class StartScreen {
   private onMotion: (() => void) | null = null;
   private onCalibrate: (() => void) | null = null;
   private onHandUi: (() => void) | null = null;
+  private onDebug: (() => void) | null = null;
 
   constructor(root: HTMLElement) {
     this.root = root;
@@ -19,18 +21,21 @@ export class StartScreen {
     this.overlay.innerHTML = `
       <div class="screen-card">
         <h1>Motion Runner</h1>
-        <p>An endless runner with keyboard or webcam pose controls.</p>
+        <p>An endless runner with keyboard or webcam pose controls. Keyboard: J = star jump.</p>
+        <div class="screen-high-score" data-role="high-score">High Score: 0</div>
         <div class="screen-actions">
           <button type="button" class="screen-btn" data-action="keyboard">Play with Keyboard</button>
           <button type="button" class="screen-btn" data-action="motion">Motion Controls</button>
           <button type="button" class="screen-btn secondary" data-action="calibrate">Calibrate</button>
           <button type="button" class="screen-btn secondary" data-action="hand-ui">Hand UI Setup</button>
+          <button type="button" class="screen-btn secondary" data-action="debug">Debug</button>
         </div>
         <div class="screen-meta" data-role="meta"></div>
       </div>
     `;
 
     this.metaEl = this.overlay.querySelector('[data-role="meta"]') as HTMLElement;
+    this.highScoreEl = this.overlay.querySelector('[data-role="high-score"]') as HTMLElement;
     this.motionBtn = this.overlay.querySelector('[data-action="motion"]') as HTMLButtonElement;
     this.calibrateBtn = this.overlay.querySelector('[data-action="calibrate"]') as HTMLButtonElement;
     this.handUiBtn = this.overlay.querySelector('[data-action="hand-ui"]') as HTMLButtonElement;
@@ -41,6 +46,9 @@ export class StartScreen {
     this.motionBtn.addEventListener('click', () => this.onMotion?.());
     this.calibrateBtn.addEventListener('click', () => this.onCalibrate?.());
     this.handUiBtn.addEventListener('click', () => this.onHandUi?.());
+    this.overlay.querySelector('[data-action="debug"]')?.addEventListener('click', () => {
+      this.onDebug?.();
+    });
 
     this.root.appendChild(this.overlay);
   }
@@ -50,6 +58,7 @@ export class StartScreen {
     hasProfile: boolean;
     hasHandProfile: boolean;
     handControlsActive: boolean;
+    highScore: number;
   }): void {
     this.calibrateBtn.textContent = opts.hasProfile ? 'Recalibrate' : 'Calibrate';
     this.motionBtn.textContent = 'Motion Controls';
@@ -60,6 +69,7 @@ export class StartScreen {
     } else {
       this.handUiBtn.textContent = 'Recalibrate Hand UI';
     }
+    this.highScoreEl.textContent = `High Score: ${Math.floor(opts.highScore)}`;
     const profileText = opts.hasProfile
       ? 'Saved calibration found — Motion Controls ready.'
       : 'No saved calibration — Motion Controls will run setup.';
@@ -90,5 +100,9 @@ export class StartScreen {
 
   onOpenHandUi(cb: () => void): void {
     this.onHandUi = cb;
+  }
+
+  onOpenDebug(cb: () => void): void {
+    this.onDebug = cb;
   }
 }
